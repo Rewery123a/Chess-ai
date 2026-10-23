@@ -1,2 +1,2 @@
 # Chess-ai
-My very own chess ai
+Goated chess ai trust....
