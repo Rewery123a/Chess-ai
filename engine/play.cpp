@@ -8,6 +8,7 @@
 using namespace chess;
 
 void play() {
+    setSearchInfo(false);
     Board b(constants::STARTPOS);
     std::vector<std::string> hist;
     std::string in;

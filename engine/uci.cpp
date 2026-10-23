@@ -40,6 +40,7 @@ void uciLoop() {
             }
         } else if (cmd == "go") {
             int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, depth = 64;
+            bool depthGiven = false, infinite = false;
             std::string tok;
             while (ss >> tok) {
                 if (tok == "wtime") ss >> wtime;
@@ -47,7 +48,8 @@ void uciLoop() {
                 else if (tok == "winc") ss >> winc;
                 else if (tok == "binc") ss >> binc;
                 else if (tok == "movetime") ss >> movetime;
-                else if (tok == "depth") ss >> depth;
+                else if (tok == "depth") { ss >> depth; depthGiven = true; }
+                else if (tok == "infinite") infinite = true;
             }
 
             // time per move: about 1/30 of the clock plus most of the increment
@@ -57,7 +59,7 @@ void uciLoop() {
             } else {
                 bool white = board.sideToMove() == Color::WHITE;
                 int clock = white ? wtime : btime, inc = white ? winc : binc;
-                if (clock < 0) ms = 3000;
+                if (clock < 0) ms = (depthGiven || infinite) ? 1000000000 : 3000;   // fixed depth: don't cut it off
                 else ms = std::max(20, std::min(std::min(clock / 30 + inc * 8 / 10, 15000), clock / 2));
             }
 

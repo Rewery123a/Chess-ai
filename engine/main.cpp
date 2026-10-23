@@ -6,7 +6,7 @@
 
 int main(int argc, char** argv) {
     if (!loadBook("Perfect2023.bin"))
-        std::cerr << "Warning: uho-pohl.bin not found, playing without a book\n";
+        std::cerr << "Warning: Perfect2023.bin not found, playing without a book\n";
     if (argc > 1 && std::string(argv[1]) == "play") play();
     else uciLoop();
     return 0;

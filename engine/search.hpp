@@ -6,3 +6,6 @@ chess::Move search(chess::Board& b, int maxDepth, int ms);
 
 // Empties the transposition table (call at the start of a new game).
 void clearTT();
+
+// Turn the per-depth "info ..." output on/off (off for terminal play).
+void setSearchInfo(bool on);
