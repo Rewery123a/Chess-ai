@@ -3,14 +3,12 @@
 #include "search.hpp"
 #include <iostream>
 #include <string>
-#include <vector>
 
 using namespace chess;
 
 void play() {
-    setSearchInfo(false);
+    setSearchInfo(false);                 // no per-depth spam in terminal play
     Board b(constants::STARTPOS);
-    std::vector<std::string> hist;
     std::string in;
     std::cout << "Play as white? (y/n): ";
     std::getline(std::cin, in);
@@ -53,12 +51,11 @@ void play() {
                 for (const Move& m : legal)
                     if (uci::moveToUci(m) == bm) { chosen = m; found = true; break; }
             if (!found) {
-                Board work = b;
+                Board work = b;           // search leaves the board mid-search on timeout
                 chosen = search(work, 64, 5000);
             }
             std::cout << "AI plays: " << uci::moveToUci(chosen) << "\n";
         }
-        hist.push_back(uci::moveToUci(chosen));
         b.makeMove(chosen);
     }
 }
