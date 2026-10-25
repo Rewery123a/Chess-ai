@@ -33,7 +33,7 @@ void play() {
             return;
         }
 
-        Move chosen;
+        Move chosen{};
         if ((b.sideToMove() == Color::WHITE) == humanWhite) {
             while (true) {
                 std::cout << "Your move (e.g. e2e4, e7e8q): ";

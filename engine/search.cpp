@@ -2,6 +2,7 @@
 #include "eval.hpp"
 #include "tables.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -43,12 +44,16 @@ enum Flag : uint8_t { EXACT, LOWER, UPPER };
 // ---------- transposition table ----------
 struct Entry {
     uint64_t key = 0;
-    Move move;
+    Move move{};
     int score = 0;
     int depth = -1;
     uint8_t flag = EXACT;
 };
-static const uint64_t TT_SIZE = 1 << 21;
+static std::atomic<bool> stopFlag{false};
+void requestStop() { stopFlag = true; }
+void resetStop() { stopFlag = false; }
+
+static const uint64_t TT_SIZE = 1 << 22
 static std::vector<Entry> TT(TT_SIZE);
 
 // ---------- ordering heuristics state ----------
@@ -84,7 +89,7 @@ static Clock::time_point deadline;
 static uint64_t nodes = 0;
 
 static inline void checkTime() {
-    if ((++nodes & 2047) == 0 && Clock::now() > deadline) throw Timeout();
+    if ((++nodes & 2047) == 0 && (stopFlag.load(std::memory_order_relaxed) || Clock::now() > deadline)) throw Timeout();
 }
 
 static inline int sideIdx(const Board& b) { return b.sideToMove() == Color::WHITE ? 0 : 1; }
@@ -203,7 +208,7 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
 
     uint64_t key = b.hash();
     Entry& e = TT[key & (TT_SIZE - 1)];
-    Move ttMove;
+    Move ttMove{};
     if (e.key == key) {
         ttMove = e.move;
         int s = fromTT(e.score, ply);
@@ -228,7 +233,7 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
     }
     orderMoves(b, moves, ttMove, ply);
 
-    Move bestMove;
+    Move bestMove{};
     for (int i = 0; i < moves.size(); ++i) {
         pickMove(moves, i);
         const Move m = moves[i];
@@ -287,7 +292,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     uint64_t key = b.hash();
     Entry& e = TT[key & (TT_SIZE - 1)];
     const int alphaOrig = alpha;
-    Move ttMove;
+    Move ttMove{};
     if (e.key == key) {
         ttMove = e.move;
         // only cut in non-PV nodes: keeps the PV exact and avoids TT-induced oddities
@@ -316,7 +321,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
 
     const int side = sideIdx(b);
     int best = -INF;
-    Move bestMove;
+    Move bestMove{};
     Move quiets[64];
     int nq = 0;
 
@@ -421,6 +426,7 @@ Move search(Board& b, int maxDepth, int ms) {
     Movelist moves;
     movegen::legalmoves(moves, b);
     if (moves.empty()) return Move();
+    if (moves.size() == 1) return moves[0];
     Move best = moves[0];
     int prevScore = 0;
 

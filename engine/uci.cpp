@@ -6,14 +6,32 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 using namespace chess;
 
-static int moveOverhead = 30;   // ms reserved for GUI / network / process latency (UCI option "Move Overhead")
+// Runs on its own thread so the main loop can still read "stop" / "quit" while thinking.
+static void thinkAndReply(Board work, int depth, int ms) {
+    std::string bm = bookMove(work);
+    if (!bm.empty()) {
+        std::cout << "bestmove " << bm << std::endl;
+        return;
+    }
+    Move m = search(work, depth, ms);
+    if (m == Move()) std::cout << "bestmove 0000" << std::endl;
+    else std::cout << "bestmove " << uci::moveToUci(m) << std::endl;
+}
 
 void uciLoop() {
     Board board(constants::STARTPOS);
     std::string line;
+    std::thread worker;
+    int moveOverhead = 50;                 // ms kept in reserve for GUI / network lag
+
+    auto finishSearch = [&]() {
+        requestStop();
+        if (worker.joinable()) worker.join();
+    };
 
     while (std::getline(std::cin, line)) {
         std::istringstream ss(line);
@@ -22,19 +40,26 @@ void uciLoop() {
 
         if (cmd == "uci") {
             std::cout << "id name MyChessAI\nid author me\n"
-                      << "option name Move Overhead type spin default 30 min 0 max 5000\n"
+                      << "option name BookFile type string default Perfect2023.bin\n"
+                      << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
                       << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
         } else if (cmd == "setoption") {
-            std::string tok, name, val;
+            std::string tok, name, value;
             ss >> tok;                                   // "name"
             while (ss >> tok && tok != "value") name += (name.empty() ? "" : " ") + tok;
-            ss >> val;
-            if (name == "Move Overhead" && !val.empty()) moveOverhead = std::max(0, std::atoi(val.c_str()));
+            while (ss >> tok) value += (value.empty() ? "" : " ") + tok;
+            if (name == "BookFile") {
+                if (!loadBook(value)) std::cerr << "Warning: could not load book " << value << std::endl;
+            } else if (name == "MoveOverhead") {
+                moveOverhead = std::max(0, std::atoi(value.c_str()));
+            }
         } else if (cmd == "ucinewgame") {
+            finishSearch();
             clearTT();
         } else if (cmd == "position") {
+            finishSearch();
             std::string t;
             ss >> t;
             if (t == "startpos") {
@@ -50,6 +75,7 @@ void uciLoop() {
                 while (ss >> mv) board.makeMove(uci::uciToMove(board, mv));
             }
         } else if (cmd == "go") {
+            finishSearch();
             int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, depth = 64;
             bool depthGiven = false, infinite = false;
             std::string tok;
@@ -63,34 +89,24 @@ void uciLoop() {
                 else if (tok == "infinite") infinite = true;
             }
 
-            // time per move: about 1/30 of the clock plus most of the increment
+            // time per move: about 1/30 of the clock plus most of the increment, minus lag reserve
             int ms;
             if (movetime > 0) {
                 ms = movetime;
             } else {
                 bool white = board.sideToMove() == Color::WHITE;
                 int clock = white ? wtime : btime, inc = white ? winc : binc;
-                if (clock < 0) ms = (depthGiven || infinite) ? 1000000000 : 3000;   // fixed depth: don't cut it off
-                else {
-                    ms = std::max(20, std::min(std::min(clock / 30 + inc * 8 / 10, 15000), clock / 2));
-                    ms = std::min(ms, std::max(5, clock - moveOverhead));   // never plan past the clock
-                }
-            }
-            if (movetime > 0 || wtime >= 0 || btime >= 0) ms = std::max(5, ms - moveOverhead);
-
-            // opening book first
-            std::string bm = bookMove(board);
-            if (!bm.empty()) {
-                std::cout << "bestmove " << bm << std::endl;
-                continue;
+                if (clock < 0) ms = (depthGiven || infinite) ? 1000000000 : 3000;   // fixed depth / analysis: no cut-off
+                else ms = std::max(20, std::min(std::min(clock / 30 + inc * 8 / 10, 15000), clock / 2) - moveOverhead);
             }
 
-            Board work = board;
-            Move m = search(work, depth, ms);
-            if (m == Move()) std::cout << "bestmove 0000" << std::endl;
-            else std::cout << "bestmove " << uci::moveToUci(m) << std::endl;
+            resetStop();
+            worker = std::thread(thinkAndReply, board, depth, ms);
+        } else if (cmd == "stop") {
+            finishSearch();                       // the worker prints "bestmove" as it unwinds
         } else if (cmd == "quit") {
             break;
         }
     }
+    finishSearch();
 }

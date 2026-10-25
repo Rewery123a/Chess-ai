@@ -9,3 +9,8 @@ void clearTT();
 
 // Turn the per-depth "info ..." output on/off (off for terminal play).
 void setSearchInfo(bool on);
+
+
+// Ask a running search to stop as soon as possible (thread-safe).
+void requestStop();
+void resetStop();
