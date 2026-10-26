@@ -14,3 +14,7 @@ void setSearchInfo(bool on);
 // Ask a running search to stop as soon as possible (thread-safe).
 void requestStop();
 void resetStop();
+
+
+// Number of nodes visited by the most recent search (used by "bench").
+uint64_t searchNodes();

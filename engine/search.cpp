@@ -39,6 +39,12 @@ static const int NMP_MIN_DEPTH = 3;
 static const int LMR_MIN_DEPTH = 3;
 static const int LMR_MIN_MOVES = 3;
 
+// pruning settings (centipawns)
+static const int RFP_MAX_DEPTH = 6, RFP_MARGIN = 80;                    // reverse futility
+static const int FP_MAX_DEPTH  = 4, FP_BASE = 120, FP_MARGIN = 100;     // futility
+static const int LMP_MAX_DEPTH = 4;                                     // late move pruning
+static const int IIR_MIN_DEPTH = 4;                                     // internal iterative reduction
+
 enum Flag : uint8_t { EXACT, LOWER, UPPER };
 
 // ---------- transposition table ----------
@@ -91,6 +97,8 @@ static uint64_t nodes = 0;
 static inline void checkTime() {
     if ((++nodes & 2047) == 0 && (stopFlag.load(std::memory_order_relaxed) || Clock::now() > deadline)) throw Timeout();
 }
+
+uint64_t searchNodes() { return nodes; }
 
 static inline int sideIdx(const Board& b) { return b.sideToMove() == Color::WHITE ? 0 : 1; }
 
@@ -304,9 +312,21 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         }
     }
 
+    // internal iterative reduction: no hash move here, so search shallower to find one cheaply
+    if (depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
+
+    // static eval, only needed (and only trusted) in quiet non-PV nodes
+    const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
+    int staticEval = 0;
+    if (prunable) staticEval = evalSide(b);
+
+    // reverse futility pruning: so far above beta that a shallow search will not change that
+    if (prunable && depth <= RFP_MAX_DEPTH && staticEval - RFP_MARGIN * depth >= beta && hasNonPawnMaterial(b))
+        return staticEval - RFP_MARGIN * depth;
+
     // --- null move pruning: if passing still beats beta, this node is almost surely a cut ---
     if (!pvNode && canNull && !inCheck && depth >= NMP_MIN_DEPTH &&
-        std::abs(beta) < MATE_BOUND && hasNonPawnMaterial(b) && evalSide(b) >= beta) {
+        std::abs(beta) < MATE_BOUND && hasNonPawnMaterial(b) && staticEval >= beta) {
         int R = 2 + depth / 4;
         b.makeNullMove();
         int s = -negamax(b, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
@@ -330,8 +350,21 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         const Move m = moves[i];
         const bool quiet = !b.isCapture(m) && m.typeOf() != Move::PROMOTION;
         const bool isKiller = m == killers[ply][0] || m == killers[ply][1];
+        const int h = quiet ? history[side][m.from().index()][m.to().index()] : 0;
 
         b.makeMove(m);
+
+        // futility / late move pruning: skip hopeless quiet moves at shallow depth (never the
+        // first move, killers, or moves that give check)
+        if (prunable && i > 0 && quiet && !isKiller && best > -MATE_BOUND) {
+            const bool lmp = depth <= LMP_MAX_DEPTH && i >= 3 + depth * depth;
+            const bool fut = depth <= FP_MAX_DEPTH && staticEval + FP_BASE + FP_MARGIN * depth <= alpha;
+            if ((lmp || fut) && !b.inCheck()) {
+                b.unmakeMove(m);
+                continue;
+            }
+        }
+
         int s;
         if (i == 0) {
             s = -negamax(b, depth - 1, -beta, -alpha, ply + 1, true);
@@ -342,6 +375,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
                 r = LMR[std::min(depth, 63)][std::min(i, 63)];
                 if (pvNode) --r;
                 if (isKiller) --r;
+                r -= h / 4096;                              // good history: reduce less, bad: more
                 r = std::max(0, std::min(r, depth - 2));
             }
             s = -negamax(b, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true);
