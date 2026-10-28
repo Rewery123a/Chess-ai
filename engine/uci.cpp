@@ -136,7 +136,7 @@ void uciLoop() {
             
         } else if (cmd == "bench") {
             int d = 0;
-            s >> d;
+            ss >> d;
             if (d <= 0) d = 9;
             finishSearch();
             runBench(d); 

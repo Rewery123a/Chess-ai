@@ -59,7 +59,7 @@ static std::atomic<bool> stopFlag{false};
 void requestStop() { stopFlag = true; }
 void resetStop() { stopFlag = false; }
 
-static const uint64_t TT_SIZE = 1 << 22
+static const uint64_t TT_SIZE = 1 << 22;
 static std::vector<Entry> TT(TT_SIZE);
 
 // ---------- ordering heuristics state ----------

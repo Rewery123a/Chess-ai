@@ -22,7 +22,7 @@ uint64_t be(const unsigned char* p, int n) { // big-endian read
 }
 
 bool loadBook(const std::string& path) {
-    book.clear()
+    book.clear();
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::vector<unsigned char> data((std::istreambuf_iterator<char>(f)),
