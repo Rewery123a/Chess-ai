@@ -48,6 +48,7 @@ static const int RFP_MAX_DEPTH = 6, RFP_MARGIN = 80;                    // rever
 static const int FP_MAX_DEPTH  = 4, FP_BASE = 120, FP_MARGIN = 100;     // futility
 static const int LMP_MAX_DEPTH = 4;                                     // late move pruning
 static const int IIR_MIN_DEPTH = 4;                                     // internal iterative reduction
+static const int SEE_PRUNE_MAX_DEPTH = 6, SEE_PRUNE_MARGIN = 90;       // skip captures with SEE < -margin * depth
 
 enum Flag : uint8_t { EXACT, LOWER, UPPER };
 
@@ -491,8 +492,19 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         const int movedPt = (int)b.at(m.from()).type();
         const int h = quiet ? histScore(side, ply, movedPt, m) : 0;
 
+        // SEE pruning: at low depth skip captures that clearly lose material. orderMoves already
+        // flagged losing captures with a negative score, so SEE is only computed for those (and the
+        // hash move, which has a huge score, is never pruned). Never the first move, never in PV or
+        // check nodes, and (below) never a move that gives check.
+        const bool seeBad = prunable && i > 0 && depth <= SEE_PRUNE_MAX_DEPTH && best > -MATE_BOUND &&
+                            !quiet && m.score() < 0 && see(b, m) < -SEE_PRUNE_MARGIN * depth;
+
         b.makeMove(m);
         stkPt[ply + 1] = movedPt; stkTo[ply + 1] = m.to().index();
+        if (seeBad && !b.inCheck()) {
+            b.unmakeMove(m);
+            continue;
+        }
 
         // futility / late move pruning: skip hopeless quiet moves at shallow depth (never the
         // first move, killers, or moves that give check)
