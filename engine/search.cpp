@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -47,25 +48,107 @@ static const int IIR_MIN_DEPTH = 4;                                     // inter
 
 enum Flag : uint8_t { EXACT, LOWER, UPPER };
 
-// ---------- transposition table ----------
-struct Entry {
-    uint64_t key = 0;
-    Move move{};
-    int score = 0;
-    int depth = -1;
-    uint8_t flag = EXACT;
+// ---------- transposition table: 64-byte buckets of 4 entries, age-aware replacement ----------
+struct Entry {                       // 16 bytes
+    uint64_t key     = 0;
+    int32_t  score   = 0;
+    uint16_t move    = 0;            // raw chess::Move encoding
+    int8_t   depth   = 0;
+    uint8_t  ageFlag = 0;            // (age << 2) | flag
+    int flag() const { return ageFlag & 3; }
+    int age()  const { return ageFlag >> 2; }
 };
+static const int BUCKET_SIZE = 4;
+struct alignas(64) Bucket { Entry e[BUCKET_SIZE]; };
+static_assert(sizeof(Entry) == 16 && sizeof(Bucket) == 64, "TT layout");
+
 static std::atomic<bool> stopFlag{false};
 void requestStop() { stopFlag = true; }
 void resetStop() { stopFlag = false; }
 
-static const uint64_t TT_SIZE = 1 << 22;
-static std::vector<Entry> TT(TT_SIZE);
+static const size_t DEFAULT_HASH_MB = 64, MAX_HASH_MB = 65536;
+static std::vector<Bucket> TT(DEFAULT_HASH_MB * 1024 * 1024 / sizeof(Bucket));
+static uint64_t ttBuckets = TT.size();
+static size_t   ttSizeMB  = DEFAULT_HASH_MB;
+static int      ttAge     = 0;       // bumped once per search(); 6 bits, wraps at 64
+
+static inline Bucket& bucketFor(uint64_t key) {
+    // multiply-shift maps the key onto any bucket count (the table need not be a power of two)
+    return TT[(uint64_t)(((unsigned __int128)key * ttBuckets) >> 64)];
+}
+
+// Returns the matching entry (and refreshes its age so it survives replacement) or nullptr.
+static inline Entry* ttProbe(uint64_t key) {
+    Bucket& bk = bucketFor(key);
+    for (int i = 0; i < BUCKET_SIZE; ++i)
+        if (bk.e[i].key == key) {
+            bk.e[i].ageFlag = (uint8_t)((ttAge << 2) | bk.e[i].flag());
+            return &bk.e[i];
+        }
+    return nullptr;
+}
+
+// Replacement: same position -> update in place (unless the old entry is clearly more valuable);
+// otherwise evict the entry with the lowest depth - 4 * age-difference (empty slots go first).
+static void ttStore(uint64_t key, uint16_t mv, int score, int depth, int flag) {
+    Bucket& bk = bucketFor(key);
+    Entry* victim = nullptr;
+    int victimValue = 1 << 30;
+    for (int i = 0; i < BUCKET_SIZE; ++i) {
+        Entry& c = bk.e[i];
+        if (c.key == key) {
+            const bool sameAge = c.age() == ttAge;
+            if (sameAge && ((depth <= 0 && c.depth > 0) || (flag != EXACT && depth + 3 <= c.depth)))
+                return;                                   // keep the deeper entry from this search
+            if (mv == 0) mv = c.move;                     // never lose a known move for a bound without one
+            victim = &c;
+            break;
+        }
+        const int value = c.key == 0 ? -100000 : c.depth - 4 * ((ttAge - c.age() + 64) & 63);
+        if (value < victimValue) { victimValue = value; victim = &c; }
+    }
+    // quiescence entries (depth 0) must not push out useful deeper entries
+    if (depth <= 0 && victim->key != key && victimValue > 0) return;
+
+    victim->key     = key;
+    victim->score   = score;
+    victim->move    = mv;
+    victim->depth   = (int8_t)std::max(-127, std::min(depth, 127));
+    victim->ageFlag = (uint8_t)((ttAge << 2) | flag);
+}
+
+void setHashSize(size_t mb) {
+    mb = std::max<size_t>(1, std::min(mb, MAX_HASH_MB));
+    std::vector<Bucket>().swap(TT);                       // release the old table first
+    try {
+        TT.resize(mb * 1024 * 1024 / sizeof(Bucket));
+        ttSizeMB = mb;
+    } catch (const std::bad_alloc&) {
+        std::cerr << "Warning: could not allocate " << mb << " MB hash, using 1 MB" << std::endl;
+        TT.resize(1024 * 1024 / sizeof(Bucket));
+        ttSizeMB = 1;
+    }
+    ttBuckets = TT.size();
+    ttAge = 0;
+}
+size_t hashSizeMB() { return ttSizeMB; }
+
+// permille of sampled slots holding an entry from the current search (for "info hashfull")
+static int hashfull() {
+    const uint64_t n = std::min<uint64_t>(ttBuckets, 250);
+    int used = 0;
+    for (uint64_t i = 0; i < n; ++i)
+        for (int j = 0; j < BUCKET_SIZE; ++j)
+            if (TT[i].e[j].key != 0 && TT[i].e[j].age() == ttAge) ++used;
+    return (int)(used * 1000 / (n * BUCKET_SIZE));
+}
 
 // ---------- ordering heuristics state ----------
 static Move killers[MAX_PLY + 1][2];
 static int  history[2][64][64];          // [side][from][to]
 static int  LMR[64][64];                 // [depth][moveCount]
+static const int NO_EVAL = -INF;         // "no static eval at this ply" (side was in check)
+static int  evalStack[MAX_PLY + 2];      // static eval per ply, for the "improving" flag
 static bool lmrReady = false;
 static bool printInfo = true;
 
@@ -78,7 +161,8 @@ static void initLMR() {
 }
 
 void clearTT() {
-    std::fill(TT.begin(), TT.end(), Entry());
+    std::fill(TT.begin(), TT.end(), Bucket());
+    ttAge = 0;
     std::memset(history, 0, sizeof(history));
     for (auto& k : killers) k[0] = k[1] = Move();
 }
@@ -215,14 +299,13 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
     const int alphaOrig = alpha;
 
     uint64_t key = b.hash();
-    Entry& e = TT[key & (TT_SIZE - 1)];
     Move ttMove{};
-    if (e.key == key) {
-        ttMove = e.move;
-        int s = fromTT(e.score, ply);
-        if (e.flag == EXACT) return s;
-        if (e.flag == LOWER && s >= beta) return s;
-        if (e.flag == UPPER && s <= alpha) return s;
+    if (const Entry* e = ttProbe(key)) {
+        ttMove = Move(e->move);
+        int s = fromTT(e->score, ply);
+        if (e->flag() == EXACT) return s;
+        if (e->flag() == LOWER && s >= beta) return s;
+        if (e->flag() == UPPER && s <= alpha) return s;
     }
 
     Movelist moves;
@@ -267,14 +350,10 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
         if (alpha >= beta) break;
     }
 
-    // qsearch entries are depth 0: never let them evict a real (depth > 0) entry,
-    // otherwise the millions of qsearch nodes wipe out the useful deep entries.
-    if (e.depth <= 0) {
-        e.key = key;
-        e.move = bestMove;
-        e.score = toTT(best, ply);
-        e.depth = 0;
-        e.flag = best <= alphaOrig ? UPPER : (best >= beta ? LOWER : EXACT);
+    // qsearch entries are depth 0; ttStore keeps them from evicting real (depth > 0) entries
+    {
+        const int flag = best <= alphaOrig ? UPPER : (best >= beta ? LOWER : EXACT);
+        ttStore(key, flag == UPPER ? 0 : bestMove.move(), toTT(best, ply), 0, flag);
     }
     return best;
 }
@@ -298,31 +377,42 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     const bool pvNode = beta - alpha > 1;
 
     uint64_t key = b.hash();
-    Entry& e = TT[key & (TT_SIZE - 1)];
     const int alphaOrig = alpha;
     Move ttMove{};
-    if (e.key == key) {
-        ttMove = e.move;
+    if (const Entry* e = ttProbe(key)) {
+        ttMove = Move(e->move);
         // only cut in non-PV nodes: keeps the PV exact and avoids TT-induced oddities
-        if (!pvNode && e.depth >= depth) {
-            int s = fromTT(e.score, ply);
-            if (e.flag == EXACT) return s;
-            if (e.flag == LOWER && s >= beta) return s;
-            if (e.flag == UPPER && s <= alpha) return s;
+        if (!pvNode && e->depth >= depth) {
+            int s = fromTT(e->score, ply);
+            if (e->flag() == EXACT) return s;
+            if (e->flag() == LOWER && s >= beta) return s;
+            if (e->flag() == UPPER && s <= alpha) return s;
         }
     }
 
     // internal iterative reduction: no hash move here, so search shallower to find one cheaply
     if (depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
 
-    // static eval, only needed (and only trusted) in quiet non-PV nodes
+    // static eval for every node that is not in check (PV nodes too: they feed "improving" below)
     const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
-    int staticEval = 0;
-    if (prunable) staticEval = evalSide(b);
+    int staticEval = NO_EVAL;
+    if (!inCheck) staticEval = evalSide(b);
+    evalStack[ply] = staticEval;
 
-    // reverse futility pruning: so far above beta that a shallow search will not change that
-    if (prunable && depth <= RFP_MAX_DEPTH && staticEval - RFP_MARGIN * depth >= beta && hasNonPawnMaterial(b))
-        return staticEval - RFP_MARGIN * depth;
+    // improving: our static eval is better than two plies ago (same side to move); fall back to four
+    // plies ago if we were in check then. When improving we trust the position more and prune/reduce
+    // less aggressively where it is risky, and more where it is safe (see each use below).
+    bool improving = false;
+    if (!inCheck) {
+        int prev = ply >= 2 ? evalStack[ply - 2] : NO_EVAL;
+        if (prev == NO_EVAL && ply >= 4) prev = evalStack[ply - 4];
+        improving = prev != NO_EVAL && staticEval > prev;
+    }
+
+    // reverse futility pruning: so far above beta that a shallow search will not change that;
+    // an improving side needs a smaller margin
+    if (prunable && depth <= RFP_MAX_DEPTH && staticEval - RFP_MARGIN * (depth - improving) >= beta && hasNonPawnMaterial(b))
+        return staticEval - RFP_MARGIN * (depth - improving);
 
     // --- null move pruning: if passing still beats beta, this node is almost surely a cut ---
     if (!pvNode && canNull && !inCheck && depth >= NMP_MIN_DEPTH &&
@@ -357,7 +447,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         // futility / late move pruning: skip hopeless quiet moves at shallow depth (never the
         // first move, killers, or moves that give check)
         if (prunable && i > 0 && quiet && !isKiller && best > -MATE_BOUND) {
-            const bool lmp = depth <= LMP_MAX_DEPTH && i >= 3 + depth * depth;
+            const bool lmp = depth <= LMP_MAX_DEPTH && i >= (3 + depth * depth) / (improving ? 1 : 2);
             const bool fut = depth <= FP_MAX_DEPTH && staticEval + FP_BASE + FP_MARGIN * depth <= alpha;
             if ((lmp || fut) && !b.inCheck()) {
                 b.unmakeMove(m);
@@ -375,6 +465,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
                 r = LMR[std::min(depth, 63)][std::min(i, 63)];
                 if (pvNode) --r;
                 if (isKiller) --r;
+                if (!improving) ++r;                        // eval going nowhere: reduce more
                 r -= h / 4096;                              // good history: reduce less, bad: more
                 r = std::max(0, std::min(r, depth - 2));
             }
@@ -400,13 +491,10 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         if (quiet && nq < 64) quiets[nq++] = m;
     }
 
-    // keep a deeper entry for the same position
-    if (e.key != key || depth >= e.depth) {
-        e.key = key;
-        e.move = bestMove;
-        e.score = toTT(best, ply);
-        e.depth = depth;
-        e.flag = best <= alphaOrig ? UPPER : (best >= beta ? LOWER : EXACT);
+    // fail-low nodes have no real best move, so store none (ttStore keeps any older one)
+    {
+        const int flag = best <= alphaOrig ? UPPER : (best >= beta ? LOWER : EXACT);
+        ttStore(key, flag == UPPER ? 0 : bestMove.move(), toTT(best, ply), depth, flag);
     }
     return best;
 }
@@ -418,6 +506,8 @@ static std::string scoreStr(int s) {
 }
 
 // ---------- root search (PVS) ----------
+static uint64_t rootBestNodes = 0;     // nodes spent on the current best root move (time management)
+
 static int rootSearch(Board& b, Movelist& moves, int depth, int alpha, int beta, Move& best) {
     orderMoves(b, moves, best, 0);
     std::stable_sort(moves.begin(), moves.end(),
@@ -425,6 +515,7 @@ static int rootSearch(Board& b, Movelist& moves, int depth, int alpha, int beta,
     int bestScore = -INF;
     bool first = true;
     for (const Move& m : moves) {
+        const uint64_t n0 = nodes;
         b.makeMove(m);
         int s;
         if (first) {
@@ -441,40 +532,51 @@ static int rootSearch(Board& b, Movelist& moves, int depth, int alpha, int beta,
         if (s > alpha) {
             alpha = s;
             best = m;
+            rootBestNodes = nodes - n0;
             if (alpha >= beta) break;
         }
     }
     return bestScore;
 }
 
-// ---------- iterative deepening with aspiration windows and a time limit ----------
+// ---------- iterative deepening with aspiration windows and time management ----------
+// Hard limit: the search is aborted mid-iteration (checkTime). Soft limit: checked after every
+// finished iteration and stretched or shrunk by how settled the search looks.
+static const double STAB_SCALE[9] = {1.40, 1.20, 1.05, 0.95, 0.88, 0.82, 0.78, 0.75, 0.72};
+
 // Note: on timeout the board passed in is left mid-search, so callers must pass a copy.
-Move search(Board& b, int maxDepth, int ms) {
+Move search(Board& b, const SearchLimits& lim) {
     initLMR();
     auto start = Clock::now();
-    deadline = start + std::chrono::milliseconds(ms);
+    deadline = start + std::chrono::milliseconds(lim.hardMs);
     nodes = 0;
+    ttAge = (ttAge + 1) & 63;                       // new search = new TT generation
     for (auto& k : killers) k[0] = k[1] = Move();
     for (auto& s : history) for (auto& f : s) for (int& h : f) h /= 2;   // age, don't wipe
 
     Movelist moves;
     movegen::legalmoves(moves, b);
     if (moves.empty()) return Move();
-    if (moves.size() == 1) return moves[0];
-    Move best = moves[0];
-    int prevScore = 0;
+    if (moves.size() == 1 && !lim.infinite) return moves[0];   // forced move: don't burn the clock
+    Move best = moves[0], prevBest = best;
+    int prevScore = 0, stability = 0;
+    evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);     // root eval, read by plies 2 and 4
 
-    for (int d = 1; d <= maxDepth; ++d) {
+    for (int d = 1; d <= lim.maxDepth; ++d) {
         try {
+            const int lastScore = prevScore;
             int alpha = -INF, beta = INF, delta = ASP_DELTA;
-            if (d >= ASP_MIN_DEPTH && std::abs(prevScore) < MATE_BOUND) {
-                alpha = std::max(prevScore - delta, -INF);
-                beta  = std::min(prevScore + delta,  INF);
+            if (d >= ASP_MIN_DEPTH && std::abs(lastScore) < MATE_BOUND) {
+                alpha = std::max(lastScore - delta, -INF);
+                beta  = std::min(lastScore + delta,  INF);
             }
 
             int score;
+            uint64_t iterNodes = 0;
             while (true) {
+                const uint64_t n0 = nodes;
                 score = rootSearch(b, moves, d, alpha, beta, best);
+                iterNodes = nodes - n0;
                 if (score <= alpha) {
                     beta  = (alpha + beta) / 2;
                     alpha = std::max(score - delta, -INF);
@@ -488,16 +590,47 @@ Move search(Board& b, int maxDepth, int ms) {
             }
 
             prevScore = score;
+            const long long t = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
             if (printInfo) {
-                long long t = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
                 std::cout << "info depth " << d << " score " << scoreStr(score)
-                          << " nodes " << nodes << " time " << t
+                          << " nodes " << nodes << " nps " << (t > 0 ? nodes * 1000 / t : nodes)
+                          << " hashfull " << hashfull() << " time " << t
                           << " pv " << uci::moveToUci(best) << std::endl;
             }
             if (score >= MATE_BOUND) break;
+
+            // ---- time management ----
+            stability = (d >= 2 && best == prevBest) ? std::min(stability + 1, 8) : 0;
+            prevBest = best;
+            if (!lim.infinite) {
+                double target = (double)lim.softMs;
+                if (lim.dynamic && d >= 6) {
+                    double scale = STAB_SCALE[stability];                       // same move for long -> less time
+                    const int drop = lastScore - score;
+                    if (drop > 0)        scale *= 1.0 + std::min(drop, 80) * 0.006;   // score falling -> think more
+                    else if (drop < -20) scale *= 0.95;                         // clearly improving -> relax
+                    if (d >= 8 && iterNodes > 0) {                              // one dominant root move -> less time
+                        double frac = (double)rootBestNodes / (double)iterNodes;
+                        scale *= std::max(0.7, std::min(1.5, 1.7 - frac));
+                    }
+                    scale = std::max(0.4, std::min(scale, 2.5));
+                    target = std::min(target * scale, (double)lim.hardMs);
+                }
+                if ((double)t >= target) break;
+            }
         } catch (const Timeout&) {
             break;
         }
     }
     return best;
+}
+
+// Convenience overload: fixed depth and a single time budget (terminal play, bench).
+Move search(Board& b, int maxDepth, int ms) {
+    SearchLimits lim;
+    lim.maxDepth = maxDepth;
+    lim.hardMs = ms;
+    lim.softMs = (int64_t)(ms * 0.6);
+    lim.dynamic = true;
+    return search(b, lim);
 }

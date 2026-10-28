@@ -41,14 +41,32 @@ void runBench(int depth) {
     setSearchInfo(true);
 }
 
+// Splits the clock into a soft target and a hard cap for this move.
+// Sudden death: ~1/30 of the clock plus most of the increment. With movestogo: spread the clock over
+// the moves left to the next time control. The hard cap is a few times the soft target but always
+// a safe fraction of what is left, so one deep search can never flag us.
+static void allocateTime(int64_t clock, int64_t inc, int movestogo, int overhead, SearchLimits& lim) {
+    const double avail = (double)std::max<int64_t>(1, clock - overhead);
+    const int mtg = movestogo > 0 ? std::min(movestogo, 50) : 30;
+    double soft = avail / mtg + inc * 0.75;
+    if (mtg == 1) soft = avail * 0.7;                    // last move before the control: use most of it
+    const double hardFrac = mtg == 1 ? 0.90 : (mtg <= 3 ? 0.60 : 0.40);
+    double hard = std::min(soft * 5.0, avail * hardFrac);
+    hard = std::max(hard, 1.0);
+    soft = std::max(1.0, std::min(soft, hard));
+    lim.softMs = (int64_t)soft;
+    lim.hardMs = (int64_t)hard;
+    lim.dynamic = true;
+}
+
 // Runs on its own thread so the main loop can still read "stop" / "quit" while thinking.
-static void thinkAndReply(Board work, int depth, int ms) {
+static void thinkAndReply(Board work, SearchLimits lim) {
     std::string bm = bookMove(work);
     if (!bm.empty()) {
         std::cout << "bestmove " << bm << std::endl;
         return;
     }
-    Move m = search(work, depth, ms);
+    Move m = search(work, lim);
     if (m == Move()) std::cout << "bestmove 0000" << std::endl;
     else std::cout << "bestmove " << uci::moveToUci(m) << std::endl;
 }
@@ -73,6 +91,8 @@ void uciLoop() {
             std::cout << "id name MyChessAI\nid author me\n"
                       << "option name BookFile type string default Perfect2023.bin\n"
                       << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
+                      << "option name Hash type spin default 64 min 1 max 65536\n"
+                      << "option name Clear Hash type button\n"
                       << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
@@ -85,6 +105,12 @@ void uciLoop() {
                 if (!loadBook(value)) std::cerr << "Warning: could not load book " << value << std::endl;
             } else if (name == "MoveOverhead") {
                 moveOverhead = std::max(0, std::atoi(value.c_str()));
+            } else if (name == "Hash") {
+                finishSearch();                          // the table must not be resized mid-search
+                setHashSize((size_t)std::max(1, std::atoi(value.c_str())));
+            } else if (name == "Clear Hash") {
+                finishSearch();
+                clearTT();
             }
         } else if (cmd == "ucinewgame") {
             finishSearch();
@@ -107,7 +133,7 @@ void uciLoop() {
             }
         } else if (cmd == "go") {
             finishSearch();
-            int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, depth = 64;
+            int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, movestogo = -1, depth = 64;
             bool depthGiven = false, infinite = false;
             std::string tok;
             while (ss >> tok) {
@@ -115,25 +141,28 @@ void uciLoop() {
                 else if (tok == "btime") ss >> btime;
                 else if (tok == "winc") ss >> winc;
                 else if (tok == "binc") ss >> binc;
+                else if (tok == "movestogo") ss >> movestogo;
                 else if (tok == "movetime") ss >> movetime;
                 else if (tok == "depth") { ss >> depth; depthGiven = true; }
                 else if (tok == "infinite") infinite = true;
             }
 
-            // time per move: about 1/30 of the clock plus most of the increment, minus lag reserve
-            int ms;
+            SearchLimits lim;
+            lim.maxDepth = depth;
+            lim.infinite = infinite;
             if (movetime > 0) {
-                ms = movetime;
+                lim.softMs = lim.hardMs = std::max(1, movetime - moveOverhead);   // fixed time: use all of it
             } else {
                 bool white = board.sideToMove() == Color::WHITE;
                 int clock = white ? wtime : btime, inc = white ? winc : binc;
-                if (clock < 0) ms = (depthGiven || infinite) ? 1000000000 : 3000;   // fixed depth / analysis: no cut-off
-                else ms = std::max(20, std::min(std::min(clock / 30 + inc * 8 / 10, 15000), clock / 2) - moveOverhead);
+                if (clock >= 0) allocateTime(clock, inc, movestogo, moveOverhead, lim);
+                else if (!depthGiven && !infinite) lim.softMs = lim.hardMs = 3000;
+                // else: fixed depth / analysis, no cut-off
             }
 
             resetStop();
-            worker = std::thread(thinkAndReply, board, depth, ms);
-            
+            worker = std::thread(thinkAndReply, board, lim);
+
         } else if (cmd == "bench") {
             int d = 0;
             ss >> d;
