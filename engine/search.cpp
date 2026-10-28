@@ -33,6 +33,9 @@ static const int S_TT      = 32000;
 static const int S_CAPTURE = 20000;   // + MVV-LVA
 static const int S_KILLER1 = 15000;
 static const int S_KILLER2 = 14000;
+static const int S_COUNTER = 13000;   // countermove: quiet move that refuted the opponent's last move
+static const int S_BAD     = -28000;  // + MVV-LVA: captures that lose material (SEE < 0) go after all quiets
+static const int QUIET_MAX = 12000, QUIET_MIN = -24000;   // clamp for combined quiet history scores
 static const int MAX_HIST  = 8192;    // quiet history lives in [-MAX_HIST, MAX_HIST]
 
 // null move / LMR settings
@@ -146,6 +149,12 @@ static int hashfull() {
 // ---------- ordering heuristics state ----------
 static Move killers[MAX_PLY + 1][2];
 static int  history[2][64][64];          // [side][from][to]
+// continuation history: how good a quiet move is, given the move made 1 (countermove history) or
+// 2 (follow-up history) plies earlier. [distance-1][prev piece type*64 + prev to][side*6 + piece type)*64 + to]
+static int  contHist[2][6 * 64][2 * 6 * 64];
+static Move counterMove[6][64];          // [prev piece type][prev to] -> quiet move that refuted it
+// the move that led INTO each ply (stkTo < 0: none, e.g. root or after a null move)
+static int  stkPt[MAX_PLY + 2], stkTo[MAX_PLY + 2];
 static int  LMR[64][64];                 // [depth][moveCount]
 static const int NO_EVAL = -INF;         // "no static eval at this ply" (side was in check)
 static int  evalStack[MAX_PLY + 2];      // static eval per ply, for the "improving" flag
@@ -164,6 +173,8 @@ void clearTT() {
     std::fill(TT.begin(), TT.end(), Bucket());
     ttAge = 0;
     std::memset(history, 0, sizeof(history));
+    std::memset(contHist, 0, sizeof(contHist));
+    for (auto& row : counterMove) for (Move& m : row) m = Move();
     for (auto& k : killers) k[0] = k[1] = Move();
 }
 
@@ -186,16 +197,39 @@ uint64_t searchNodes() { return nodes; }
 
 static inline int sideIdx(const Board& b) { return b.sideToMove() == Color::WHITE ? 0 : 1; }
 
-static void updateHistory(int side, const Move& m, int bonus) {
-    int& h = history[side][m.from().index()][m.to().index()];
+static inline void gravity(int& h, int bonus) {
     h += bonus - h * std::abs(bonus) / MAX_HIST;      // "gravity": h stays within +-MAX_HIST
 }
 
+static inline int curIdx(int side, int pt, int to) { return (side * 6 + pt) * 64 + to; }
+
+// quiet move score: main history + countermove history (1 ply back) + follow-up history (2 plies back)
+static inline int histScore(int side, int ply, int pt, const Move& m) {
+    const int to = m.to().index(), cur = curIdx(side, pt, to);
+    int s = history[side][m.from().index()][to];
+    if (stkTo[ply] >= 0)                s += contHist[0][stkPt[ply] * 64 + stkTo[ply]][cur];
+    if (ply >= 1 && stkTo[ply - 1] >= 0) s += contHist[1][stkPt[ply - 1] * 64 + stkTo[ply - 1]][cur];
+    return s;
+}
+
+// board must be in the position the move was played from
+static void updateQuiet(const Board& b, int side, int ply, const Move& m, int bonus) {
+    const int pt = (int)b.at(m.from()).type(), to = m.to().index(), cur = curIdx(side, pt, to);
+    gravity(history[side][m.from().index()][to], bonus);
+    if (stkTo[ply] >= 0)                gravity(contHist[0][stkPt[ply] * 64 + stkTo[ply]][cur], bonus);
+    if (ply >= 1 && stkTo[ply - 1] >= 0) gravity(contHist[1][stkPt[ply - 1] * 64 + stkTo[ply - 1]][cur], bonus);
+}
+
+static int see(const Board& b, const Move& m);       // defined below
+
 // ---------- move ordering ----------
-// tt move > captures (MVV-LVA) > killers > quiet moves by history.
+// tt move > good captures (MVV-LVA, SEE >= 0) > killers > countermove > quiets by combined history
+// > losing captures (SEE < 0).
 // Only assigns scores; callers use pickMove() so we never sort the whole list.
-static void orderMoves(const Board& b, Movelist& moves, Move ttMove, int ply) {
+// useCont is false in quiescence, where the continuation context is not tracked.
+static void orderMoves(const Board& b, Movelist& moves, Move ttMove, int ply, bool useCont = true) {
     const int side = sideIdx(b);
+    const Move counter = (useCont && stkTo[ply] >= 0) ? counterMove[stkPt[ply]][stkTo[ply]] : Move();
     for (Move& m : moves) {
         int s;
         if (m == ttMove) {
@@ -204,16 +238,27 @@ static void orderMoves(const Board& b, Movelist& moves, Move ttMove, int ply) {
             int v = (int)b.at(m.to()).type();
             if (v > 5) v = 0;                           // en passant
             int a = (int)b.at(m.from()).type();
-            s = S_CAPTURE + 100 + 10 * ORDER_VALUE[v] - ORDER_VALUE[a];
-            if (m.typeOf() == Move::PROMOTION) s += 80;
+            const int mvvLva = 100 + 10 * ORDER_VALUE[v] - ORDER_VALUE[a];
+            const bool promo = m.typeOf() == Move::PROMOTION;
+            // SEE only when the attacker is worth more than the victim (otherwise it cannot lose material)
+            if (!promo && ORDER_VALUE[v] < ORDER_VALUE[a] && see(b, m) < 0) {
+                s = S_BAD + mvvLva;
+            } else {
+                s = S_CAPTURE + mvvLva;
+                if (promo) s += 80;
+            }
         } else if (m.typeOf() == Move::PROMOTION) {
             s = S_CAPTURE + 80;
         } else if (m == killers[ply][0]) {
             s = S_KILLER1;
         } else if (m == killers[ply][1]) {
             s = S_KILLER2;
+        } else if (counter != Move() && m == counter) {
+            s = S_COUNTER;
         } else {
-            s = history[side][m.from().index()][m.to().index()];
+            if (useCont) s = histScore(side, ply, (int)b.at(m.from()).type(), m);
+            else         s = history[side][m.from().index()][m.to().index()];
+            s = std::max(QUIET_MIN, std::min(s, QUIET_MAX));
         }
         m.setScore((int16_t)s);
     }
@@ -322,7 +367,7 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
         best = stand;
         movegen::legalmoves<movegen::MoveGenType::CAPTURE>(moves, b);
     }
-    orderMoves(b, moves, ttMove, ply);
+    orderMoves(b, moves, ttMove, ply, false);
 
     Move bestMove{};
     for (int i = 0; i < moves.size(); ++i) {
@@ -338,7 +383,9 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
             if (promo) gain += PIECE_VALUE[(int)m.promotionType()] - PIECE_VALUE[0];
             if (stand + gain + DELTA_MARGIN < alpha) continue;
 
-            if (!promo && ORDER_VALUE[victim] < ORDER_VALUE[attacker] && see(b, m) < 0) continue;
+            // losing captures were already marked by orderMoves (negative score); the tt move was not
+            if (!promo && ORDER_VALUE[victim] < ORDER_VALUE[attacker] &&
+                (m == ttMove ? see(b, m) < 0 : m.score() < 0)) continue;
         }
 
         b.makeMove(m);
@@ -418,6 +465,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     if (!pvNode && canNull && !inCheck && depth >= NMP_MIN_DEPTH &&
         std::abs(beta) < MATE_BOUND && hasNonPawnMaterial(b) && staticEval >= beta) {
         int R = 2 + depth / 4;
+        stkTo[ply + 1] = -1; stkPt[ply + 1] = 0;
         b.makeNullMove();
         int s = -negamax(b, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
         b.unmakeNullMove();
@@ -440,9 +488,11 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         const Move m = moves[i];
         const bool quiet = !b.isCapture(m) && m.typeOf() != Move::PROMOTION;
         const bool isKiller = m == killers[ply][0] || m == killers[ply][1];
-        const int h = quiet ? history[side][m.from().index()][m.to().index()] : 0;
+        const int movedPt = (int)b.at(m.from()).type();
+        const int h = quiet ? histScore(side, ply, movedPt, m) : 0;
 
         b.makeMove(m);
+        stkPt[ply + 1] = movedPt; stkTo[ply + 1] = m.to().index();
 
         // futility / late move pruning: skip hopeless quiet moves at shallow depth (never the
         // first move, killers, or moves that give check)
@@ -466,7 +516,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
                 if (pvNode) --r;
                 if (isKiller) --r;
                 if (!improving) ++r;                        // eval going nowhere: reduce more
-                r -= h / 4096;                              // good history: reduce less, bad: more
+                r -= h / 12288;                             // good combined history: reduce less, bad: more
                 r = std::max(0, std::min(r, depth - 2));
             }
             s = -negamax(b, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true);
@@ -483,8 +533,9 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
             if (quiet) {
                 if (!(m == killers[ply][0])) { killers[ply][1] = killers[ply][0]; killers[ply][0] = m; }
                 int bonus = std::min(depth * depth, 1200);
-                updateHistory(side, m, bonus);
-                for (int q = 0; q < nq; ++q) updateHistory(side, quiets[q], -bonus);   // penalise quiets that failed
+                updateQuiet(b, side, ply, m, bonus);
+                for (int q = 0; q < nq; ++q) updateQuiet(b, side, ply, quiets[q], -bonus);   // penalise quiets that failed
+                if (stkTo[ply] >= 0) counterMove[stkPt[ply]][stkTo[ply]] = m;
             }
             break;
         }
@@ -516,6 +567,7 @@ static int rootSearch(Board& b, Movelist& moves, int depth, int alpha, int beta,
     bool first = true;
     for (const Move& m : moves) {
         const uint64_t n0 = nodes;
+        stkPt[1] = (int)b.at(m.from()).type(); stkTo[1] = m.to().index();
         b.makeMove(m);
         int s;
         if (first) {
@@ -560,6 +612,7 @@ Move search(Board& b, const SearchLimits& lim) {
     if (moves.size() == 1 && !lim.infinite) return moves[0];   // forced move: don't burn the clock
     Move best = moves[0], prevBest = best;
     int prevScore = 0, stability = 0;
+    stkTo[0] = -1; stkPt[0] = 0;                            // no move led into the root
     evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);     // root eval, read by plies 2 and 4
 
     for (int d = 1; d <= lim.maxDepth; ++d) {
