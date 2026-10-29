@@ -26,6 +26,8 @@ static const char* BENCH_FENS[] = {
     "3r2k1/p4ppp/1p6/8/2P5/1P3P2/P5PP/3R2K1 w - - 0 1"};
 
 void runBench(int depth) {
+    const size_t oldHash = hashSizeMB();             // NEW (first lines)
+    setHashSize(16);                                 // NEW: fixed table size so bench numbers don't depend on Hash
     setSearchInfo(false);
     uint64_t total = 0;
     auto t0 = std::chrono::steady_clock::now();
@@ -39,6 +41,7 @@ void runBench(int depth) {
     std::cout << "Nodes searched: " << total << "\nTime: " << (long long)ms << " ms\nNPS: "
               << (long long)(total / (ms / 1000.0)) << std::endl;
     setSearchInfo(true);
+    setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
 }
 
 // Splits the clock into a soft target and a hard cap for this move.
@@ -168,6 +171,7 @@ void uciLoop() {
             ss >> d;
             if (d <= 0) d = 9;
             finishSearch();
+            resetStop();
             runBench(d); 
                
         } else if (cmd == "stop") {

@@ -1,6 +1,7 @@
 #include "eval.hpp"
 #include "tables.hpp"
 #include <algorithm>
+#include <vectors>
 #include <cstdint>
 #include <cstdlib>
 
@@ -333,7 +334,24 @@ int evaluate(const Board& b) {
     return (mgScore * ph + egScore * (24 - ph)) / 24;
 }
 
+// ---------- evaluation cache ----------
+// The evaluation depends only on the position, and the search keeps meeting the same positions again.
+// Index = low hash bits, check = high 32 bits.
+namespace {
+struct EvalEntry { uint32_t check; int32_t score; };
+constexpr size_t EVAL_CACHE_SIZE = 1 << 20;                      // 8 MB
+std::vector<EvalEntry> evalCache(EVAL_CACHE_SIZE, EvalEntry{0, 0});
+}
+
 int evalSide(const Board& b) {
+    const uint64_t key = b.hash();
+    EvalEntry& e = evalCache[key & (EVAL_CACHE_SIZE - 1)];
+    const uint32_t check = (uint32_t)(key >> 32) | 1u;           // "| 1" keeps an empty slot from matching
+    if (e.check == check) return e.score;
     int s = evaluate(b);
-    return (b.sideToMove() == Color::WHITE ? s : -s) + TEMPO;
+    s = (b.sideToMove() == Color::WHITE ? s : -s) + TEMPO;
+    e.check = check;
+    e.score = s;
+    return s;
+}
 }
