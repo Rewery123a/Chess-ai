@@ -21,20 +21,20 @@ inline U64 rankBB(int r) { return 0xFFULL << (8 * r); }
 inline int cheb(int a, int b) { return std::max(std::abs((a & 7) - (b & 7)), std::abs((a >> 3) - (b >> 3))); }
 
 // ---------- tuning knobs (centipawns) ----------
-const int MG_VAL[5] = {100, 320, 330, 500, 900};     // P N B R Q, middlegame
-const int EG_VAL[5] = {115, 310, 330, 530, 940};     // endgame
+const int MG_VAL[5] = {100, 336, 338, 500, 966};     // P N B R Q, middlegame
+const int EG_VAL[5] = {109, 317, 354, 530, 1009};     // endgame
 
 const int PASSED_MG[8] = {0,  5, 10, 20,  35,  60, 100, 0};   // by rank (from own side)
 const int PASSED_EG[8] = {0, 10, 20, 40,  70, 120, 200, 0};
 
 const int ISOLATED_MG = 12, ISOLATED_EG = 18;
 const int DOUBLED_MG  = 10, DOUBLED_EG  = 20;
-const int BISHOP_PAIR_MG = 30, BISHOP_PAIR_EG = 50;
+const int BISHOP_PAIR_MG = 32, BISHOP_PAIR_EG = 54;
 const int ROOK_OPEN_MG = 25, ROOK_OPEN_EG = 15;
 const int ROOK_SEMI_MG = 12, ROOK_SEMI_EG = 8;
 const int SHIELD_PAWN = 8;                   // per pawn in front of a castled king (max 4)
 const int OPEN_FILE_KING = 20, SEMI_FILE_KING = 12;
-const int TEMPO = 10;
+const int TEMPO =7;
 
 const int PHASE_W[5] = {0, 1, 1, 2, 4};      // total 24 at the start
 

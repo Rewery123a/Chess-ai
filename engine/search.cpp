@@ -48,6 +48,9 @@ static const int RFP_MAX_DEPTH = 6, RFP_MARGIN = 80;                    // rever
 static const int FP_MAX_DEPTH  = 4, FP_BASE = 120, FP_MARGIN = 100;     // futility
 static const int LMP_MAX_DEPTH = 4;                                     // late move pruning
 static const int IIR_MIN_DEPTH = 4;                                     // internal iterative reduction
+static const int SE_MIN_DEPTH = 7, SE_MARGIN = 2;                       // singular extension: margin = SE_MARGIN * depth
+static const int RAZOR_MAX_DEPTH = 3, RAZOR_BASE = 200, RAZOR_MARGIN = 150;   // razoring: eval + base + margin * depth <= alpha
+static const int PROBCUT_MIN_DEPTH = 5, PROBCUT_MARGIN = 160, PROBCUT_REDUCTION = 4;
 static const int SEE_PRUNE_MAX_DEPTH = 6, SEE_PRUNE_MARGIN = 90;       // skip captures with SEE < -margin * depth
 
 enum Flag : uint8_t { EXACT, LOWER, UPPER };
@@ -413,7 +416,7 @@ static bool hasNonPawnMaterial(const Board& b) {
 }
 
 // ---------- main search: negamax + PVS + TT + NMP + LMR + killers/history ----------
-static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNull) {
+static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNull, Move excluded = Move()) {
     checkTime();
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || b.isRepetition(1)) return 0;
     if (ply >= MAX_PLY) return evalSide(b);
@@ -423,12 +426,17 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     if (depth <= 0) return quiesce(b, alpha, beta, ply);
 
     const bool pvNode = beta - alpha > 1;
+    // a singular-extension verification search: same position as its parent, one move excluded.
+    // Its result only holds for "everything except that move", so it never reads or writes the TT.
+    const bool singular = !(excluded == Move());
 
     uint64_t key = b.hash();
     const int alphaOrig = alpha;
     Move ttMove{};
-    if (const Entry* e = ttProbe(key)) {
+    int ttScore = 0, ttDepth = -1, ttFlag = 0;
+    if (const Entry* e = singular ? nullptr : ttProbe(key)) {
         ttMove = Move(e->move);
+        ttScore = fromTT(e->score, ply); ttDepth = e->depth; ttFlag = e->flag();
         // only cut in non-PV nodes: keeps the PV exact and avoids TT-induced oddities
         if (!pvNode && e->depth >= depth) {
             int s = fromTT(e->score, ply);
@@ -439,7 +447,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     }
 
     // internal iterative reduction: no hash move here, so search shallower to find one cheaply
-    if (depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
+    if (!singular && depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
 
     // static eval for every node that is not in check (PV nodes too: they feed "improving" below)
     const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
@@ -457,9 +465,14 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         improving = prev != NO_EVAL && staticEval > prev;
     }
 
+    if (prunable && !singular && depth <= RAZOR_MAX_DEPTH && staticEval + RAZOR_BASE + RAZOR_MARGIN * depth <= alpha) {
+        const int v = quiesce(b, alpha - 1, alpha, ply);
+        if (v < alpha) return v;
+    }
+
     // reverse futility pruning: so far above beta that a shallow search will not change that;
     // an improving side needs a smaller margin
-    if (prunable && depth <= RFP_MAX_DEPTH && staticEval - RFP_MARGIN * (depth - improving) >= beta && hasNonPawnMaterial(b))
+    if (prunable && !singular && depth <= RFP_MAX_DEPTH && staticEval - RFP_MARGIN * (depth - improving) >= beta && hasNonPawnMaterial(b))
         return staticEval - RFP_MARGIN * (depth - improving);
 
     // --- null move pruning: if passing still beats beta, this node is almost surely a cut ---
@@ -471,6 +484,33 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         int s = -negamax(b, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
         b.unmakeNullMove();
         if (s >= beta) return s >= MATE_BOUND ? beta : s;     // never trust unproven mate scores
+    }
+
+    if (prunable && !singular && depth >= PROBCUT_MIN_DEPTH) {
+        const int probBeta = beta + PROBCUT_MARGIN;
+        if (!(ttDepth >= depth - 3 && ttFlag != LOWER && ttScore < probBeta)) {
+            Movelist caps;
+            movegen::legalmoves<movegen::MoveGenType::CAPTURE>(caps, b);
+            orderMoves(b, caps, ttMove, ply);
+            for (int i = 0; i < caps.size(); ++i) {
+                pickMove(caps, i);
+                const Move m = caps[i];
+                if (!b.isCapture(m) && m.typeOf() != Move::PROMOTION) continue;
+                if (see(b,m) < probBeta - staticEval) continue;
+                const int movedPt = (int)b.at(m.from()).type();
+                b.makeMove(m);
+                stkPt[ply + 1] = movedPt; stkTo[ply + 1] = m.to().index();
+                int s = -quiesce(b, -probBeta, -probBeta + 1, ply + 1);
+                if (s >= probBeta) {
+                    s = -negamax(b, depth - PROBCUT_REDUCTION, -probBeta, -probBeta + 1, ply + 1, true);
+                }
+                b.unmakeMove(m);
+                if (s >= probBeta) {
+                    ttStore(key, m.move(), toTT(s, ply), depth - PROBCUT_REDUCTION + 1, LOWER);
+                    return s - (probBeta - beta);
+                }
+            }
+        }
     }
 
     Movelist moves;
@@ -487,10 +527,20 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     for (int i = 0; i < moves.size(); ++i) {
         pickMove(moves, i);
         const Move m = moves[i];
+        if (singular && m == excluded) continue;
         const bool quiet = !b.isCapture(m) && m.typeOf() != Move::PROMOTION;
         const bool isKiller = m == killers[ply][0] || m == killers[ply][1];
         const int movedPt = (int)b.at(m.from()).type();
         const int h = quiet ? histScore(side, ply, movedPt, m) : 0;
+
+        int ext = 0;
+        if (i == 0 && !singular && ply > 0 && depth >= SE_MIN_DEPTH && m == ttMove && ttFlag != UPPER && ttDepth >= depth - 3 && std::abs(ttScore) < MATE_BOUND) {
+            const int sBeta = ttScore - SE_MARGINE * depth;
+            const int sv = negamax(b, (depth - 1 ) / 2, sBeta - 1, sBeta, ply, false, m);
+            if (sv < sBeta) ext = 1;
+            else if (sBeta >= beta) return sBeta;
+            else if (ttScore >= beta) ext = -1;
+        }
 
         // SEE pruning: at low depth skip captures that clearly lose material. orderMoves already
         // flagged losing captures with a negative score, so SEE is only computed for those (and the
@@ -519,7 +569,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
 
         int s;
         if (i == 0) {
-            s = -negamax(b, depth - 1, -beta, -alpha, ply + 1, true);
+            s = -negamax(b, depth - 1 + ext, -beta, -alpha, ply + 1, true);
         } else {
             // late move reduction: late quiet moves are probably bad, so search them shallower
             int r = 0;
@@ -555,7 +605,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     }
 
     // fail-low nodes have no real best move, so store none (ttStore keeps any older one)
-    {
+    if (!singular) {
         const int flag = best <= alphaOrig ? UPPER : (best >= beta ? LOWER : EXACT);
         ttStore(key, flag == UPPER ? 0 : bestMove.move(), toTT(best, ply), depth, flag);
     }
