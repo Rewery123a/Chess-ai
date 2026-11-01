@@ -706,8 +706,7 @@ Move search(Board& b, const SearchLimits& lim) {
         if (tbProbeRoot(b, r)) {
             if (r.wdl >= 2 || r.wdl <= -2) {
                 if (printInfo)
-                    std::cout << "info depth 1 score cp " << (r.wdl > 0 ? TB_WIN : -TB_WIN)
-                              << " nodes 0 tbhits 1 pv " << uci::moveToUci(r.best) << std::endl;
+                    std::cout << "info depth 1 score cp " << (r.wdl > 0 ? TB_WIN : -TB_WIN) << " nodes 0 tbhits 1 pv " << uci::moveToUci(r.best) << std::endl;
                 return r.best;
             }
             moves = r.keep;

@@ -27,7 +27,6 @@ static const char* BENCH_FENS[] = {
     "3r2k1/p4ppp/1p6/8/2P5/1P3P2/P5PP/3R2K1 w - - 0 1"};
 
 void runBench(int depth) {
-    const bool oldTb = tbEnabled();
     tbSetEnabled(false);                             // tablebases off so bench node counts stay fixed
     const size_t oldHash = hashSizeMB();             // NEW (first lines)
     setHashSize(16);                                 // NEW: fixed table size so bench numbers don't depend on Hash
@@ -45,7 +44,7 @@ void runBench(int depth) {
               << (long long)(total / (ms / 1000.0)) << std::endl;
     setSearchInfo(true);
     setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
-    tbSetEnabled(oldTb);
+    tbSetEnabled(true);
 }
 
 // Splits the clock into a soft target and a hard cap for this move.
