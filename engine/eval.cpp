@@ -1,7 +1,7 @@
 #include "eval.hpp"
 #include "tables.hpp"
 #include <algorithm>
-#include <vectors>
+#include <vector>
 #include <cstdint>
 #include <cstdlib>
 
@@ -353,5 +353,4 @@ int evalSide(const Board& b) {
     e.check = check;
     e.score = s;
     return s;
-}
 }

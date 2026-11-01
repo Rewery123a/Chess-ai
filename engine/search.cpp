@@ -535,7 +535,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
 
         int ext = 0;
         if (i == 0 && !singular && ply > 0 && depth >= SE_MIN_DEPTH && m == ttMove && ttFlag != UPPER && ttDepth >= depth - 3 && std::abs(ttScore) < MATE_BOUND) {
-            const int sBeta = ttScore - SE_MARGINE * depth;
+            const int sBeta = ttScore - SE_MARGIN * depth;
             const int sv = negamax(b, (depth - 1 ) / 2, sBeta - 1, sBeta, ply, false, m);
             if (sv < sBeta) ext = 1;
             else if (sBeta >= beta) return sBeta;
