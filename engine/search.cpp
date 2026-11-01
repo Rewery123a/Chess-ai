@@ -42,6 +42,7 @@ static const int S_KILLER1 = 15000;
 static const int S_KILLER2 = 14000;
 static const int S_COUNTER = 13000;   // countermove: quiet move that refuted the opponent's last move
 static const int S_BAD     = -28000;  // + MVV-LVA: captures that lose material (SEE < 0) go after all quiets
+static const int S_BAD_THRESH = -26000;   // below every clamped quiet score, above every losing capture
 static const int QUIET_MAX = 12000, QUIET_MIN = -24000;   // clamp for combined quiet history scores
 static const int MAX_HIST  = 8192;    // quiet history lives in [-MAX_HIST, MAX_HIST]
 
@@ -236,6 +237,8 @@ struct ThreadData {
     // continuation history: how good a quiet move is, given the move made 1 (countermove history) or
     // 2 (follow-up history) plies earlier. [distance-1][prev piece type*64 + prev to][(side*6 + piece type)*64 + to]
     int      contHist[2][6 * 64][2 * 6 * 64];
+    // capture history: how good a capture is, by [side][moving piece type][to square][captured piece type]
+    int      capHist[2][6][64][6];
     Move     counterMove[6][64];                  // [prev piece type][prev to] -> quiet move that refuted it
     // the move that led INTO each ply (stkTo < 0: none, e.g. root or after a null move)
     int      stkPt[MAX_PLY + 2], stkTo[MAX_PLY + 2];
@@ -255,6 +258,7 @@ struct ThreadData {
         doneBest = Move();
         std::memset(history, 0, sizeof(history));
         std::memset(contHist, 0, sizeof(contHist));
+        std::memset(capHist, 0, sizeof(capHist));
         for (auto& row : counterMove) for (Move& m : row) m = Move();
         for (auto& k : killers) k[0] = k[1] = Move();
         std::memset(stkPt, 0, sizeof(stkPt));
@@ -375,6 +379,18 @@ static void updateQuiet(ThreadData& td, const Board& b, int side, int ply, const
     if (ply >= 1 && td.stkTo[ply - 1] >= 0)  gravity(td.contHist[1][td.stkPt[ply - 1] * 64 + td.stkTo[ply - 1]][cur], bonus);
 }
 
+// captured piece type of a capture (en passant counts as a pawn); board = position before the move
+static inline int capVictim(const Board& b, const Move& m) {
+    int v = (int)b.at(m.to()).type();
+    return v > 5 ? 0 : v;
+}
+static inline int capHistScore(const ThreadData& td, const Board& b, int side, const Move& m) {
+    return td.capHist[side][(int)b.at(m.from()).type()][m.to().index()][capVictim(b, m)];
+}
+static inline void updateCapture(ThreadData& td, const Board& b, int side, const Move& m, int bonus) {
+    gravity(td.capHist[side][(int)b.at(m.from()).type()][m.to().index()][capVictim(b, m)], bonus);
+}
+
 static int see(const Board& b, const Move& m);       // defined below
 
 // ---------- move ordering ----------
@@ -393,7 +409,8 @@ static void orderMoves(ThreadData& td, const Board& b, Movelist& moves, Move ttM
             int v = (int)b.at(m.to()).type();
             if (v > 5) v = 0;                           // en passant
             int a = (int)b.at(m.from()).type();
-            const int mvvLva = 100 + 10 * ORDER_VALUE[v] - ORDER_VALUE[a];
+            const int mvvLva = 100 + 10 * ORDER_VALUE[v] - ORDER_VALUE[a]
+                             + td.capHist[side][a][m.to().index()][v] / 16;   // +-512: reorders within a band only
             const bool promo = m.typeOf() == Move::PROMOTION;
             // SEE only when the attacker is worth more than the victim (otherwise it cannot lose material)
             if (!promo && ORDER_VALUE[v] < ORDER_VALUE[a] && see(b, m) < 0) {
@@ -575,6 +592,15 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || b.isRepetition(1)) return 0;
     if (ply >= MAX_PLY) return evalSide(b);
 
+    // mate distance pruning: no line from here can score better than mating on the next ply, or
+    // worse than being mated right now. If that already closes the window, a shorter mate was found
+    // elsewhere in the tree and this node cannot improve on it. (Skipped at the root.)
+    if (ply > 0) {
+        alpha = std::max(alpha, -MATE + ply);
+        beta  = std::min(beta,   MATE - ply - 1);
+        if (alpha >= beta) return alpha;
+    }
+
     const bool inCheck = b.inCheck();
     if (inCheck) ++depth;
     if (depth <= 0) return quiesce(td, b, alpha, beta, ply);
@@ -699,6 +725,12 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     Move bestMove{};
     Move quiets[64];
     int nq = 0;
+    Move captures[32];                                 // captures tried before a cutoff (for capture history malus)
+    int ncap = 0;
+    // LMR context: a noisy hash move means the quiet moves here are probably worse; a countermove
+    // is a quiet move that already refuted the opponent's last move once.
+    const bool ttNoisy = !(ttMove == Move()) && (b.isCapture(ttMove) || ttMove.typeOf() == Move::PROMOTION);
+    const Move counter = td.stkTo[ply] >= 0 ? td.counterMove[td.stkPt[ply]][td.stkTo[ply]] : Move();
 
     for (int i = 0; i < moves.size(); ++i) {
         pickMove(moves, i);
@@ -707,7 +739,8 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         const bool quiet = !b.isCapture(m) && m.typeOf() != Move::PROMOTION;
         const bool isKiller = m == td.killers[ply][0] || m == td.killers[ply][1];
         const int movedPt = (int)b.at(m.from()).type();
-        const int h = quiet ? histScore(td, side, ply, movedPt, m) : 0;
+        const int h = quiet ? histScore(td, side, ply, movedPt, m)
+                            : (b.isCapture(m) ? capHistScore(td, b, side, m) : 0);
 
         int ext = 0;
         if (i == 0 && !singular && ply > 0 && depth >= SE_MIN_DEPTH && m == ttMove && ttFlag != UPPER && ttDepth >= depth - 3 && std::abs(ttScore) < MATE_BOUND) {
@@ -748,14 +781,19 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         if (i == 0) {
             s = -negamax(td, b, depth - 1 + ext, -beta, -alpha, ply + 1, true);
         } else {
-            // late move reduction: late quiet moves are probably bad, so search them shallower
+            // late move reduction: late quiet moves (and clearly losing captures) are probably bad,
+            // so search them shallower. Adjustments push the base reduction up or down.
             int r = 0;
-            if (depth >= LMR_MIN_DEPTH && i >= LMR_MIN_MOVES && quiet && !inCheck && !b.inCheck()) {
+            const bool badCapture = !quiet && m.score() < S_BAD_THRESH;
+            if (depth >= LMR_MIN_DEPTH && i >= LMR_MIN_MOVES && (quiet || badCapture) && !inCheck && !b.inCheck()) {
                 r = LMR[std::min(depth, 63)][std::min(i, 63)];
-                if (pvNode) --r;
+                if (pvNode) --r;                            // PV nodes matter more: reduce less
                 if (isKiller) --r;
+                if (m == counter) --r;                      // known refutation of the previous move
                 if (!improving) ++r;                        // eval going nowhere: reduce more
-                r -= h / 12288;                             // good combined history: reduce less, bad: more
+                if (ttNoisy && quiet) ++r;                  // the hash move is a capture: quiets rarely beat it
+                if (badCapture) --r;                        // losing captures: more careful than quiets
+                r -= quiet ? h / 12288 : h / 4096;          // good history: reduce less, bad: more (capture history has a smaller range)
                 r = std::max(0, std::min(r, depth - 2));
             }
             s = -negamax(td, b, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true);
@@ -777,16 +815,21 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
             }
         }
         if (alpha >= beta) {
+            const int bonus = std::min(depth * depth, 1200);
             if (quiet) {
                 if (!(m == td.killers[ply][0])) { td.killers[ply][1] = td.killers[ply][0]; td.killers[ply][0] = m; }
-                int bonus = std::min(depth * depth, 1200);
                 updateQuiet(td, b, side, ply, m, bonus);
                 for (int q = 0; q < nq; ++q) updateQuiet(td, b, side, ply, quiets[q], -bonus);   // penalise quiets that failed
                 if (td.stkTo[ply] >= 0) td.counterMove[td.stkPt[ply]][td.stkTo[ply]] = m;
+            } else if (b.isCapture(m)) {
+                updateCapture(td, b, side, m, bonus);
             }
+            // captures that were tried first but did not cut are penalised, whatever move finally did
+            for (int c = 0; c < ncap; ++c) updateCapture(td, b, side, captures[c], -bonus);
             break;
         }
         if (quiet && nq < 64) quiets[nq++] = m;
+        else if (!quiet && ncap < 32 && b.isCapture(m)) captures[ncap++] = m;
     }
 
     if (pvNode && best > tbCeil) best = tbCeil;       // a tablebase loss caps what this node can score
@@ -1007,6 +1050,7 @@ Move search(Board& b, const SearchLimits& lim) {
         t.doneBest = Move();
         for (auto& k : t.killers) k[0] = k[1] = Move();
         for (auto& s : t.history) for (auto& f : s) for (int& h : f) h /= 2;   // age, don't wipe
+        for (auto& a : t.capHist) for (auto& b2 : a) for (auto& c : b2) for (int& h : c) h /= 2;
     }
 
     Movelist moves;

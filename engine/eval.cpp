@@ -84,6 +84,63 @@ inline U64 pawnAttacks(U64 p, int c) {
     return ((p >> 9) & ~FILE_H) | ((p >> 7) & ~FILE_A);
 }
 
+// ---------- pawn hash ----------
+// Everything in the pawn evaluation that depends ONLY on where the pawns are (material, piece-square,
+// isolated / doubled / backward / connected) is cached per pawn structure. Passed pawns also depend on
+// the pieces (blockers, king distance), so only the set of passed pawns is cached; their score is
+// computed in evaluate(). The cache is per thread (no sharing, so no torn reads) and is verified
+// against the exact pawn bitboards, so a hit is always correct. An all-zero slot is the correct entry
+// for a position without pawns.
+struct PawnEntry {
+    U64 pawns[2];            // key: white / black pawns
+    U64 passed[2];           // passed pawns per colour
+    int16_t mg[2], eg[2];    // pawn-structure score per colour (passed-pawn bonuses not included)
+};
+constexpr size_t PAWN_CACHE_SIZE = 1 << 14;
+
+void computePawnEntry(PawnEntry& pe, U64 wp, U64 bp) {
+    const U64 pawns[2] = {wp, bp};
+    const U64 pawnAtt[2] = {pawnAttacks(wp, 0), pawnAttacks(bp, 1)};
+    pe.pawns[0] = wp; pe.pawns[1] = bp;
+    for (int c = 0; c < 2; ++c) {
+        const int e = c ^ 1;
+        int mgv = 0, egv = 0;
+        U64 passed = 0, bb = pawns[c];
+        while (bb) {
+            int sq = popLsb(bb), f = sq & 7, r = sq >> 3;
+            int rel = c == 0 ? r : 7 - r;
+            int psq = c == 0 ? (sq ^ 56) : sq;
+            mgv += MG_VAL[0] + PAWN_PST[psq];
+            egv += EG_VAL[0] + PAWN_PST[psq];
+            const U64 sqb = 1ULL << sq;
+            const int stop = c == 0 ? sq + 8 : sq - 8;          // pawns are never on the first/last rank
+            if (!(M.passed[c][sq] & pawns[e])) passed |= sqb;
+            const U64 friendsAdj = M.adj[f] & pawns[c];
+            if (!friendsAdj)                    { mgv -= ISOLATED_MG;    egv -= ISOLATED_EG; }
+            if (fileBB(f) & M.ahead[c][r] & pawns[c]) { mgv -= DOUBLED_MG; egv -= DOUBLED_EG; }
+            // backward: has neighbours, but none level or behind it, and an enemy pawn controls the stop square
+            if (friendsAdj && !(friendsAdj & (M.ahead[e][r] | rankBB(r))) && (pawnAtt[e] & (1ULL << stop))) {
+                mgv -= BACKWARD_MG; egv -= BACKWARD_EG;
+            }
+            // connected: defended by a pawn, and/or side by side with one
+            if (pawnAtt[c] & sqb)           { mgv += CONN_MG[rel];     egv += CONN_EG[rel]; }
+            if (friendsAdj & rankBB(r))     { mgv += CONN_MG[rel] / 2; egv += CONN_EG[rel] / 2; }
+        }
+        pe.passed[c] = passed;
+        pe.mg[c] = (int16_t)mgv;
+        pe.eg[c] = (int16_t)egv;
+    }
+}
+
+const PawnEntry& pawnEntry(U64 wp, U64 bp) {
+    thread_local PawnEntry table[PAWN_CACHE_SIZE];     // zero-initialised: valid for "no pawns"
+    U64 h = wp * 0x9E3779B97F4A7C15ULL ^ bp * 0xC2B2AE3D27D4EB4FULL;
+    h ^= h >> 29;
+    PawnEntry& pe = table[h & (PAWN_CACHE_SIZE - 1)];
+    if (pe.pawns[0] != wp || pe.pawns[1] != bp) computePawnEntry(pe, wp, bp);
+    return pe;
+}
+
 } // namespace
 
 // Score from White's point of view, blending middlegame and endgame by material left.
@@ -111,40 +168,28 @@ int evaluate(const Board& b) {
     const U64 pawnAtt[2] = {pawnAttacks(pcs[0][0], 0), pawnAttacks(pcs[1][0], 1)};
     U64 attN[2] = {0, 0}, attB[2] = {0, 0}, attR[2] = {0, 0}, attQ[2] = {0, 0};   // squares attacked, by piece type
 
+    const PawnEntry& pawnE = pawnEntry(pcs[0][0], pcs[1][0]);
+
     for (int c = 0; c < 2; ++c) {
         const int e = c ^ 1;
         const U64 area = ~side[c] & ~pawnAtt[e];      // squares worth counting for mobility
         U64 bb;
 
-        // pawns
-        bb = pcs[c][0];
+        // pawns: the structure score comes from the pawn hash; passed pawns are scored here because
+        // they depend on blockers and king distance
+        mg[c] += pawnE.mg[c]; eg[c] += pawnE.eg[c];
+        bb = pawnE.passed[c];
         while (bb) {
-            int sq = popLsb(bb), f = sq & 7, r = sq >> 3;
+            int sq = popLsb(bb), r = sq >> 3;
             int rel = c == 0 ? r : 7 - r;
-            int psq = c == 0 ? (sq ^ 56) : sq;
-            mg[c] += MG_VAL[0] + PAWN_PST[psq];
-            eg[c] += EG_VAL[0] + PAWN_PST[psq];
-            const U64 sqb = 1ULL << sq;
             const int stop = c == 0 ? sq + 8 : sq - 8;          // pawns are never on the first/last rank
-            if (!(M.passed[c][sq] & pcs[e][0])) {
-                // passed pawn: worth less when blocked (a blockading piece is worst), more with the kings placed well
-                int pm = PASSED_MG[rel], pe = PASSED_EG[rel];
-                if (side[e] & (1ULL << stop))      { pm /= 2; pe /= 2; }
-                else if (side[c] & (1ULL << stop)) { pm = pm * 3 / 4; pe = pe * 3 / 4; }
-                mg[c] += pm; eg[c] += pe;
-                if (kingSq[0] >= 0 && kingSq[1] >= 0)
-                    eg[c] += PASSED_KD[rel] * (2 * std::min(cheb(kingSq[e], stop), 6) - std::min(cheb(kingSq[c], stop), 6));
-            }
-            const U64 friendsAdj = M.adj[f] & pcs[c][0];
-            if (!friendsAdj)                    { mg[c] -= ISOLATED_MG;    eg[c] -= ISOLATED_EG; }
-            if (fileBB(f) & M.ahead[c][r] & pcs[c][0]) { mg[c] -= DOUBLED_MG; eg[c] -= DOUBLED_EG; }
-            // backward: has neighbours, but none level or behind it, and an enemy pawn controls the stop square
-            if (friendsAdj && !(friendsAdj & (M.ahead[e][r] | rankBB(r))) && (pawnAtt[e] & (1ULL << stop))) {
-                mg[c] -= BACKWARD_MG; eg[c] -= BACKWARD_EG;
-            }
-            // connected: defended by a pawn, and/or side by side with one
-            if (pawnAtt[c] & sqb)           { mg[c] += CONN_MG[rel];     eg[c] += CONN_EG[rel]; }
-            if (friendsAdj & rankBB(r))     { mg[c] += CONN_MG[rel] / 2; eg[c] += CONN_EG[rel] / 2; }
+            // passed pawn: worth less when blocked (a blockading piece is worst), more with the kings placed well
+            int pm = PASSED_MG[rel], pe = PASSED_EG[rel];
+            if (side[e] & (1ULL << stop))      { pm /= 2; pe /= 2; }
+            else if (side[c] & (1ULL << stop)) { pm = pm * 3 / 4; pe = pe * 3 / 4; }
+            mg[c] += pm; eg[c] += pe;
+            if (kingSq[0] >= 0 && kingSq[1] >= 0)
+                eg[c] += PASSED_KD[rel] * (2 * std::min(cheb(kingSq[e], stop), 6) - std::min(cheb(kingSq[c], stop), 6));
         }
 
         // knights
