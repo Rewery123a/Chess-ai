@@ -10,7 +10,7 @@ using namespace chess;
 
 static bool g_loaded = false;
 static bool g_enabled = true;
-static bool g_probeDepth = 1;
+static int g_probeDepth = 1;
 
 bool tbInit(const std::string& path) {
     if (g_loaded) { tb_free(); g_loaded = false; }

@@ -27,7 +27,6 @@ static const char* BENCH_FENS[] = {
     "3r2k1/p4ppp/1p6/8/2P5/1P3P2/P5PP/3R2K1 w - - 0 1"};
 
 void runBench(int depth) {
-    const bool oldTb = tbEnabled();
     const int oldThreads = threadCount();
     setThreads(1);                                   // one thread so bench node counts are deterministic
     tbSetEnabled(false);                             // tablebases off so bench node counts stay fixed
@@ -47,7 +46,7 @@ void runBench(int depth) {
               << (long long)(total / (ms / 1000.0)) << std::endl;
     setSearchInfo(true);
     setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
-    tbSetEnabled(oldTb);
+    tbSetEnabled(true);
     setThreads(oldThreads);
 }
 
