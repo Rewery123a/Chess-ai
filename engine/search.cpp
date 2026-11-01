@@ -19,7 +19,7 @@ using Clock = std::chrono::steady_clock;
 
 static const int MATE = 100000, MATE_BOUND = MATE - 512, INF = 1000000;
 static const int MAX_PLY = 128;
-static const int TB_WIN = 30000;
+static const int TB_WIN  = 30000;   // tablebase win: far above any eval, far below MATE_BOUND
 
 // aspiration window settings (centipawns)
 static const int ASP_MIN_DEPTH = 5;
@@ -447,15 +447,17 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
             if (e->flag() == UPPER && s <= alpha) return s;
         }
     }
-    
+
+    // ---- Syzygy WDL probe (non-root, not inside a singular verification search) ----
+    // A win/loss is only a bound (a faster win or a longer loss may exist), a draw is exact.
     int tbFloor = -INF, tbCeil = INF;
     if (!singular && ply > 0 && depth >= tbProbeDepth() && b.halfMoveClock() == 0 && tbCanProbe(b)) {
         int wdl;
         if (tbProbeWDL(b, wdl)) {
             int score, flag;
-            if (wdl >= 2)      { score =  TB_WIN - ply; flag = LOWER; }
-            else if (wdl <= 2) { score = -TB_WIN + ply; flag = UPPER; }
-            else               { score = 0;             flag = EXACT; }
+            if (wdl >= 2)       { score =  TB_WIN - ply; flag = LOWER; }
+            else if (wdl <= -2) { score = -TB_WIN + ply; flag = UPPER; }
+            else                { score = 0;             flag = EXACT; }   // incl. cursed win / blessed loss
             if (flag == EXACT || (flag == LOWER && score >= beta) || (flag == UPPER && score <= alpha)) {
                 ttStore(key, 0, flag == LOWER ? TB_WIN : (flag == UPPER ? -TB_WIN : 0), std::min(depth + 6, 100), flag);
                 return score;
@@ -625,7 +627,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         if (quiet && nq < 64) quiets[nq++] = m;
     }
 
-    if (pvNode && best > tbCeil) best = tbCeil;
+    if (pvNode && best > tbCeil) best = tbCeil;       // a tablebase loss caps what this node can score
 
     // fail-low nodes have no real best move, so store none (ttStore keeps any older one)
     if (!singular) {
@@ -695,14 +697,18 @@ Move search(Board& b, const SearchLimits& lim) {
     movegen::legalmoves(moves, b);
     if (moves.empty()) return Move();
     if (moves.size() == 1 && !lim.infinite) return moves[0];   // forced move: don't burn the clock
+
+    // ---- Syzygy root probe (needs the DTZ .rtbz files) ----
+    // Win or loss: play Fathom's move (fastest win / toughest defence). Draw-ish: only search the moves
+    // that keep the tablebase result, so the engine never throws a draw away or walks into a loss.
     if (!lim.infinite && tbCanProbe(b)) {
         TBRoot r;
         if (tbProbeRoot(b, r)) {
             if (r.wdl >= 2 || r.wdl <= -2) {
-                if (printInfo) {
-                    std::cout << "info depth 1 score cp " << (r.wdl > 0 ? TB_WIN : -TB_WIN) << " nodes 0 tbhits 1 pv " << uci::moveToUci(r.best) << std::endl;
-                    return r.best;
-                }
+                if (printInfo)
+                    std::cout << "info depth 1 score cp " << (r.wdl > 0 ? TB_WIN : -TB_WIN)
+                              << " nodes 0 tbhits 1 pv " << uci::moveToUci(r.best) << std::endl;
+                return r.best;
             }
             moves = r.keep;
             if (moves.size() == 1) return moves[0];

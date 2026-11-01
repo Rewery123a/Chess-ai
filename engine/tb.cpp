@@ -3,14 +3,14 @@
 #include <cstdint>
 
 extern "C" {
-    #include "tbprobe.h"
+#include "tbprobe.h"
 }
 
 using namespace chess;
 
-static bool g_loaded = false;
+static bool g_loaded  = false;
 static bool g_enabled = true;
-static bool g_probeDepth = 1;
+static int  g_probeDepth = 1;
 
 bool tbInit(const std::string& path) {
     if (g_loaded) { tb_free(); g_loaded = false; }
@@ -20,11 +20,11 @@ bool tbInit(const std::string& path) {
     return true;
 }
 
-int tbLargest()              { return g_loaded ? (int)TB_LARGEST : 0; }
-bool tbEnabled()             { return g_loaded && g_enabled; }
-void tbSetEnabled(bool on)   { g_enabled = on; }
-void tbSetProbeDepth(int d)  { g_probeDepth = std::max(1,d); }
-int tbProbeDepth()           { return g_probeDepth; }
+int  tbLargest()            { return g_loaded ? (int)TB_LARGEST : 0; }
+bool tbEnabled()            { return g_loaded && g_enabled; }
+void tbSetEnabled(bool on)  { g_enabled = on; }
+void tbSetProbeDepth(int d) { g_probeDepth = std::max(1, d); }
+int  tbProbeDepth()         { return g_probeDepth; }
 
 bool tbCanProbe(const Board& b) {
     if (!tbEnabled()) return false;
@@ -36,14 +36,14 @@ struct Bits { uint64_t w, b, k, q, r, bi, n, p; };
 
 static Bits bitsOf(const Board& b) {
     Bits x;
-    x.w = b.us(Color::WHITE).getBits();
-    x.b = b.us(Color::BLACK).getBits();
-    x.k = b.pieces(PieceType::KING).getBits();
-    x.q = b.pieces(PieceType::QUEEN).getBits();
-    x.r = b.pieces(PieceType::ROOK).getBits();
+    x.w  = b.us(Color::WHITE).getBits();
+    x.b  = b.us(Color::BLACK).getBits();
+    x.k  = b.pieces(PieceType::KING).getBits();
+    x.q  = b.pieces(PieceType::QUEEN).getBits();
+    x.r  = b.pieces(PieceType::ROOK).getBits();
     x.bi = b.pieces(PieceType::BISHOP).getBits();
-    x.n = b.pieces(PieceType::KNIGHT).getBits();
-    x.p = b.pieces(PieceType::PAWN).getBits();
+    x.n  = b.pieces(PieceType::KNIGHT).getBits();
+    x.p  = b.pieces(PieceType::PAWN).getBits();
     return x;
 }
 
@@ -51,10 +51,12 @@ static unsigned epOf(const Board& b) {
     return b.enpassantSq() == Square::NO_SQ ? 0u : (unsigned)b.enpassantSq().index();
 }
 
+// Fathom: TB_LOSS 0, TB_BLESSED_LOSS 1, TB_DRAW 2, TB_CURSED_WIN 3, TB_WIN 4  ->  -2..2
 bool tbProbeWDL(const Board& b, int& wdl) {
     if (!tbCanProbe(b) || b.halfMoveClock() != 0) return false;
     const Bits x = bitsOf(b);
-    const unsigned r = tb_probe_wdl(x.w, x.b, x.k, x.q, x.r, x.bi, x.n, x.p, 0, 0, epOf(b), b.sideToMove() == Color::WHITE);
+    const unsigned r = tb_probe_wdl(x.w, x.b, x.k, x.q, x.r, x.bi, x.n, x.p, 0, 0, epOf(b),
+                                    b.sideToMove() == Color::WHITE);
     if (r == TB_RESULT_FAILED) return false;
     wdl = (int)r - 2;
     return true;
@@ -64,17 +66,19 @@ bool tbProbeRoot(const Board& b, TBRoot& out) {
     if (!tbCanProbe(b)) return false;
     const Bits x = bitsOf(b);
     unsigned results[TB_MAX_MOVES];
-    const unsigned r = tb_probe_root(x.w, x.b, x.k, x.q, x.r, x.bi, x.n, x.p, b.halfMoveClock(), 0, epOf(b), b.sideToMove() == Color::WHITE, results);
+    const unsigned r = tb_probe_root(x.w, x.b, x.k, x.q, x.r, x.bi, x.n, x.p, b.halfMoveClock(), 0,
+                                     epOf(b), b.sideToMove() == Color::WHITE, results);
     if (r == TB_RESULT_FAILED || r == TB_RESULT_CHECKMATE || r == TB_RESULT_STALEMATE) return false;
 
     Movelist legal;
     movegen::legalmoves(legal, b);
 
+    // Fathom move (from, to, promotion) -> legal move of the board
     auto find = [&](unsigned from, unsigned to, unsigned promo) -> Move {
         for (const Move& m : legal) {
             if ((unsigned)m.from().index() != from || (unsigned)m.to().index() != to) continue;
             const bool isPromo = m.typeOf() == Move::PROMOTION;
-            unsigned mp = 0;
+            unsigned mp = 0;                               // Fathom: 1 queen, 2 rook, 3 bishop, 4 knight
             if (isPromo) {
                 switch ((int)m.promotionType()) {
                     case (int)PieceType::QUEEN:  mp = 1; break;
