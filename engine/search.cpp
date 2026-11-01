@@ -1,6 +1,7 @@
 #include "search.hpp"
 #include "eval.hpp"
 #include "tables.hpp"
+#include "tb.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -18,6 +19,7 @@ using Clock = std::chrono::steady_clock;
 
 static const int MATE = 100000, MATE_BOUND = MATE - 512, INF = 1000000;
 static const int MAX_PLY = 128;
+static const int TB_WIN = 30000;
 
 // aspiration window settings (centipawns)
 static const int ASP_MIN_DEPTH = 5;
@@ -445,6 +447,25 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
             if (e->flag() == UPPER && s <= alpha) return s;
         }
     }
+    
+    int tbFloor = -INF, tbCeil = INF;
+    if (!singular && ply > 0 && depth >= tbProbeDepth() && b.halfMoveClock() == 0 && tbCanProbe(b)) {
+        int wdl;
+        if (tbProbeWDL(b, wdl)) {
+            int score, flag;
+            if (wdl >= 2)      { score =  TB_WIN - ply; flag = LOWER; }
+            else if (wdl <= 2) { score = -TB_WIN + ply; flag = UPPER; }
+            else               { score = 0;             flag = EXACT; }
+            if (flag == EXACT || (flag == LOWER && score >= beta) || (flag == UPPER && score <= alpha)) {
+                ttStore(key, 0, flag == LOWER ? TB_WIN : (flag == UPPER ? -TB_WIN : 0), std::min(depth + 6, 100), flag);
+                return score;
+            }
+            if (pvNode) {
+                if (flag == LOWER) { tbFloor = score; alpha = std::max(alpha, score); }
+                else               tbCeil = score;
+            }
+        }
+    }
 
     // internal iterative reduction: no hash move here, so search shallower to find one cheaply
     if (!singular && depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
@@ -519,7 +540,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     orderMoves(b, moves, ttMove, ply);
 
     const int side = sideIdx(b);
-    int best = -INF;
+    int best = tbFloor;
     Move bestMove{};
     Move quiets[64];
     int nq = 0;
@@ -604,6 +625,8 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         if (quiet && nq < 64) quiets[nq++] = m;
     }
 
+    if (pvNode && best > tbCeil) best = tbCeil;
+
     // fail-low nodes have no real best move, so store none (ttStore keeps any older one)
     if (!singular) {
         const int flag = best <= alphaOrig ? UPPER : (best >= beta ? LOWER : EXACT);
@@ -672,6 +695,20 @@ Move search(Board& b, const SearchLimits& lim) {
     movegen::legalmoves(moves, b);
     if (moves.empty()) return Move();
     if (moves.size() == 1 && !lim.infinite) return moves[0];   // forced move: don't burn the clock
+    if (!lim.infinite && tbCanProbe(b)) {
+        TBRoot r;
+        if (tbProbeRoot(b, r)) {
+            if (r.wdl >= 2 || r.wdl <= -2) {
+                if (printInfo) {
+                    std::cout << "info depth 1 score cp " << (r.wdl > 0 ? TB_WIN : -TB_WIN) << " nodes 0 tbhits 1 pv " << uci::moveToUci(r.best) << std::endl;
+                    return r.best;
+                }
+            }
+            moves = r.keep;
+            if (moves.size() == 1) return moves[0];
+        }
+    }
+
     Move best = moves[0], prevBest = best;
     int prevScore = 0, stability = 0;
     stkTo[0] = -1; stkPt[0] = 0;                            // no move led into the root

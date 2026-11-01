@@ -3,6 +3,7 @@
 #include <string>
 #include "book.hpp"
 #include "play.hpp"
+#include "tb.hpp"
 #include "uci.hpp"
 
 int main(int argc, char** argv) {
@@ -13,6 +14,10 @@ int main(int argc, char** argv) {
 
     if (!loadBook("Perfect2023.bin"))
         std::cerr << "Warning: Perfect2023.bin not found, playing without a book\n";
+    if (tbInit("syzygy"))
+        std::cerr << "Syzygy tables loaded, up to " << tbLargest() << "pieces\n";
+    else
+        std::cerr << "Warning: no Syzygy tables found in ./syzygy, playing without them \n";
     if (argc > 1 && std::string(argv[1]) == "play") play();
     else uciLoop();
     return 0;

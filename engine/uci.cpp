@@ -1,6 +1,7 @@
 #include "uci.hpp"
 #include "book.hpp"
 #include "search.hpp"
+#include "tb.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -26,6 +27,8 @@ static const char* BENCH_FENS[] = {
     "3r2k1/p4ppp/1p6/8/2P5/1P3P2/P5PP/3R2K1 w - - 0 1"};
 
 void runBench(int depth) {
+    const bool oldTb = tbEnabled();
+    tbSetEnabled(false);                             // tablebases off so bench node counts stay fixed
     const size_t oldHash = hashSizeMB();             // NEW (first lines)
     setHashSize(16);                                 // NEW: fixed table size so bench numbers don't depend on Hash
     setSearchInfo(false);
@@ -42,6 +45,7 @@ void runBench(int depth) {
               << (long long)(total / (ms / 1000.0)) << std::endl;
     setSearchInfo(true);
     setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
+    tbSetEnabled(oldTb);
 }
 
 // Splits the clock into a soft target and a hard cap for this move.
@@ -96,6 +100,8 @@ void uciLoop() {
                       << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
                       << "option name Hash type spin default 64 min 1 max 65536\n"
                       << "option name Clear Hash type button\n"
+                      << "option name SyzygyPath type string default syzygy\n"
+                      << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n"
                       << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
@@ -111,6 +117,12 @@ void uciLoop() {
             } else if (name == "Hash") {
                 finishSearch();                          // the table must not be resized mid-search
                 setHashSize((size_t)std::max(1, std::atoi(value.c_str())));
+            } else if (name == "SyzygyPath") {
+                finishSearch();                          // never swap tables under a running search
+                if (!tbInit(value)) std::cerr << "Warning: no Syzygy tables found in '" << value << "'" << std::endl;
+                else std::cout << "info string Syzygy tables loaded, up to " << tbLargest() << " pieces" << std::endl;
+            } else if (name == "SyzygyProbeDepth") {
+                tbSetProbeDepth(std::atoi(value.c_str()));
             } else if (name == "Clear Hash") {
                 finishSearch();
                 clearTT();
