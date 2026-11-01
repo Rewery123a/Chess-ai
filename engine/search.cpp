@@ -9,9 +9,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace chess;
@@ -20,6 +24,7 @@ using Clock = std::chrono::steady_clock;
 static const int MATE = 100000, MATE_BOUND = MATE - 512, INF = 1000000;
 static const int MAX_PLY = 128;
 static const int TB_WIN  = 30000;   // tablebase win: far above any eval, far below MATE_BOUND
+static const int MAX_THREADS = 256;
 
 // aspiration window settings (centipawns)
 static const int ASP_MIN_DEPTH = 5;
@@ -57,8 +62,11 @@ static const int SEE_PRUNE_MAX_DEPTH = 6, SEE_PRUNE_MARGIN = 90;       // skip c
 
 enum Flag : uint8_t { EXACT, LOWER, UPPER };
 
-// ---------- transposition table: 64-byte buckets of 4 entries, age-aware replacement ----------
-struct Entry {                       // 16 bytes
+// ---------- transposition table: 64-byte buckets of 4 slots, age-aware replacement ----------
+// Shared by all search threads without locks. Each 16-byte slot holds the packed entry data and
+// (key XOR data): a read that was torn by a concurrent write fails the key check and is treated as
+// a miss, so a garbled entry is never used.
+struct TTEntry {                     // unpacked view of a slot
     uint64_t key     = 0;
     int32_t  score   = 0;
     uint16_t move    = 0;            // raw chess::Move encoding
@@ -67,63 +75,126 @@ struct Entry {                       // 16 bytes
     int flag() const { return ageFlag & 3; }
     int age()  const { return ageFlag >> 2; }
 };
+struct Slot { uint64_t keyx = 0, data = 0; };
 static const int BUCKET_SIZE = 4;
-struct alignas(64) Bucket { Entry e[BUCKET_SIZE]; };
-static_assert(sizeof(Entry) == 16 && sizeof(Bucket) == 64, "TT layout");
+struct alignas(64) Bucket { Slot e[BUCKET_SIZE]; };
+static_assert(sizeof(Slot) == 16 && sizeof(Bucket) == 64, "TT layout");
 
-static std::atomic<bool> stopFlag{false};
+static inline uint64_t packData(int32_t score, uint16_t move, int8_t depth, uint8_t ageFlag) {
+    return (uint64_t)(uint32_t)score | ((uint64_t)move << 32) | ((uint64_t)(uint8_t)depth << 48) |
+           ((uint64_t)ageFlag << 56);
+}
+static inline TTEntry loadSlot(const Slot& s) {
+    const uint64_t d = __atomic_load_n(&s.data, __ATOMIC_RELAXED);
+    const uint64_t k = __atomic_load_n(&s.keyx, __ATOMIC_RELAXED);
+    TTEntry t;
+    t.key     = k ^ d;
+    t.score   = (int32_t)(uint32_t)d;
+    t.move    = (uint16_t)(d >> 32);
+    t.depth   = (int8_t)(uint8_t)(d >> 48);
+    t.ageFlag = (uint8_t)(d >> 56);
+    return t;
+}
+static inline void storeSlot(Slot& s, uint64_t key, uint64_t data) {
+    __atomic_store_n(&s.data, data, __ATOMIC_RELAXED);
+    __atomic_store_n(&s.keyx, key ^ data, __ATOMIC_RELAXED);
+}
+
+// ---------- global search control ----------
+static std::atomic<bool> stopFlag{false};      // external stop request (UCI "stop", new command)
+static std::atomic<bool> abortFlag{false};     // internal: every thread must unwind (time up / search over)
+static std::atomic<bool> g_pondering{false};   // "go ponder" is active and has not been confirmed by "ponderhit"
+static std::atomic<int64_t> g_deadlineNs{INT64_MAX};   // hard limit (steady clock, ns); INT64_MAX while pondering
+static int64_t   g_hardNs = 0, g_softNs = 0, g_searchStartNs = 0;   // limits of the running search (under g_timeMx)
+static std::mutex g_timeMx;                    // keeps ponderhit and the start of a search consistent
+static uint64_t  g_totalNodes = 0;
+static std::vector<Move> g_lastPv;             // PV belonging to the move search() returned (for the ponder move)
+static uint64_t  g_lastPvKey = 0;              // hash of the root position that PV was searched from
+
+static inline int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
+
 void requestStop() { stopFlag = true; }
 void resetStop() { stopFlag = false; }
+bool stopRequested() { return stopFlag.load(); }
 
+void setPondering(bool on) { g_pondering = on; }
+bool isPondering() { return g_pondering.load(); }
+// The opponent played the expected move. The hard limit now counts from this moment (pondering was
+// free), but the time already spent pondering counts toward the soft limit: the search stops at the
+// end of the next iteration once it has thought "long enough" in total, which banks clock time.
+// If that time is already used up, the iteration in progress only gets a short grace period.
+void ponderHit() {
+    std::lock_guard<std::mutex> lk(g_timeMx);
+    if (!g_pondering.load()) return;
+    const int64_t n = nowNs();
+    int64_t limit = g_hardNs;
+    if (n - g_searchStartNs >= g_softNs)
+        limit = std::min(limit, std::max<int64_t>(g_softNs / 4, 20000000LL));
+    g_deadlineNs = n + limit;
+    g_pondering = false;
+}
+
+// ---------- the table itself ----------
 static const size_t DEFAULT_HASH_MB = 64, MAX_HASH_MB = 65536;
 static std::vector<Bucket> TT(DEFAULT_HASH_MB * 1024 * 1024 / sizeof(Bucket));
 static uint64_t ttBuckets = TT.size();
 static size_t   ttSizeMB  = DEFAULT_HASH_MB;
-static int      ttAge     = 0;       // bumped once per search(); 6 bits, wraps at 64
+static int      ttAge     = 0;       // bumped once per search(); 6 bits, wraps at 64. Only changed while no thread runs.
 
 static inline Bucket& bucketFor(uint64_t key) {
     // multiply-shift maps the key onto any bucket count (the table need not be a power of two)
     return TT[(uint64_t)(((unsigned __int128)key * ttBuckets) >> 64)];
 }
 
-// Returns the matching entry (and refreshes its age so it survives replacement) or nullptr.
-static inline Entry* ttProbe(uint64_t key) {
+// Start loading a position's bucket before it is needed: the table is far bigger than the caches and,
+// with several threads hammering it, a miss is the most expensive thing a node does.
+static inline void ttPrefetch(uint64_t key) { __builtin_prefetch(&bucketFor(key)); }
+
+// Fills `out` and returns true on a hit (and refreshes the entry's age so it survives replacement).
+static inline bool ttProbe(uint64_t key, TTEntry& out) {
     Bucket& bk = bucketFor(key);
-    for (int i = 0; i < BUCKET_SIZE; ++i)
-        if (bk.e[i].key == key) {
-            bk.e[i].ageFlag = (uint8_t)((ttAge << 2) | bk.e[i].flag());
-            return &bk.e[i];
+    for (int i = 0; i < BUCKET_SIZE; ++i) {
+        TTEntry c = loadSlot(bk.e[i]);
+        if (c.key == key) {
+            if (c.age() != ttAge) {
+                c.ageFlag = (uint8_t)((ttAge << 2) | c.flag());
+                storeSlot(bk.e[i], key, packData(c.score, c.move, c.depth, c.ageFlag));
+            }
+            out = c;
+            return true;
         }
-    return nullptr;
+    }
+    return false;
 }
 
 // Replacement: same position -> update in place (unless the old entry is clearly more valuable);
 // otherwise evict the entry with the lowest depth - 4 * age-difference (empty slots go first).
 static void ttStore(uint64_t key, uint16_t mv, int score, int depth, int flag) {
     Bucket& bk = bucketFor(key);
-    Entry* victim = nullptr;
+    Slot* victim = nullptr;
+    TTEntry vc;
     int victimValue = 1 << 30;
     for (int i = 0; i < BUCKET_SIZE; ++i) {
-        Entry& c = bk.e[i];
+        Slot& s = bk.e[i];
+        const TTEntry c = loadSlot(s);
         if (c.key == key) {
             const bool sameAge = c.age() == ttAge;
             if (sameAge && ((depth <= 0 && c.depth > 0) || (flag != EXACT && depth + 3 <= c.depth)))
                 return;                                   // keep the deeper entry from this search
             if (mv == 0) mv = c.move;                     // never lose a known move for a bound without one
-            victim = &c;
+            victim = &s; vc = c;
             break;
         }
         const int value = c.key == 0 ? -100000 : c.depth - 4 * ((ttAge - c.age() + 64) & 63);
-        if (value < victimValue) { victimValue = value; victim = &c; }
+        if (value < victimValue) { victimValue = value; victim = &s; vc = c; }
     }
     // quiescence entries (depth 0) must not push out useful deeper entries
-    if (depth <= 0 && victim->key != key && victimValue > 0) return;
+    if (depth <= 0 && vc.key != key && victimValue > 0) return;
 
-    victim->key     = key;
-    victim->score   = score;
-    victim->move    = mv;
-    victim->depth   = (int8_t)std::max(-127, std::min(depth, 127));
-    victim->ageFlag = (uint8_t)((ttAge << 2) | flag);
+    const int8_t d8 = (int8_t)std::max(-127, std::min(depth, 127));
+    storeSlot(*victim, key, packData((int32_t)score, mv, d8, (uint8_t)((ttAge << 2) | flag)));
 }
 
 void setHashSize(size_t mb) {
@@ -147,23 +218,76 @@ static int hashfull() {
     const uint64_t n = std::min<uint64_t>(ttBuckets, 250);
     int used = 0;
     for (uint64_t i = 0; i < n; ++i)
-        for (int j = 0; j < BUCKET_SIZE; ++j)
-            if (TT[i].e[j].key != 0 && TT[i].e[j].age() == ttAge) ++used;
+        for (int j = 0; j < BUCKET_SIZE; ++j) {
+            const TTEntry c = loadSlot(TT[i].e[j]);
+            if (c.key != 0 && c.age() == ttAge) ++used;
+        }
     return (int)(used * 1000 / (n * BUCKET_SIZE));
 }
 
-// ---------- ordering heuristics state ----------
-static Move killers[MAX_PLY + 1][2];
-static int  history[2][64][64];          // [side][from][to]
-// continuation history: how good a quiet move is, given the move made 1 (countermove history) or
-// 2 (follow-up history) plies earlier. [distance-1][prev piece type*64 + prev to][side*6 + piece type)*64 + to]
-static int  contHist[2][6 * 64][2 * 6 * 64];
-static Move counterMove[6][64];          // [prev piece type][prev to] -> quiet move that refuted it
-// the move that led INTO each ply (stkTo < 0: none, e.g. root or after a null move)
-static int  stkPt[MAX_PLY + 2], stkTo[MAX_PLY + 2];
-static int  LMR[64][64];                 // [depth][moveCount]
+// ---------- per-thread search state ----------
+// Everything a search thread writes while searching lives here, so threads never share it.
+struct ThreadData {
+    int      id = 0;                              // 0 = main thread (prints info, manages time)
+    uint64_t nodes = 0;
+    uint64_t rootBestNodes = 0;                   // nodes spent on the current best root move (time management)
+    Move     killers[MAX_PLY + 1][2];
+    int      history[2][64][64];                  // [side][from][to]
+    // continuation history: how good a quiet move is, given the move made 1 (countermove history) or
+    // 2 (follow-up history) plies earlier. [distance-1][prev piece type*64 + prev to][(side*6 + piece type)*64 + to]
+    int      contHist[2][6 * 64][2 * 6 * 64];
+    Move     counterMove[6][64];                  // [prev piece type][prev to] -> quiet move that refuted it
+    // the move that led INTO each ply (stkTo < 0: none, e.g. root or after a null move)
+    int      stkPt[MAX_PLY + 2], stkTo[MAX_PLY + 2];
+    int      evalStack[MAX_PLY + 2];              // static eval per ply, for the "improving" flag
+    // principal variation (triangular table): pv[ply][ply .. pvLen[ply]-1] is the line found from that ply
+    Move     pv[MAX_PLY + 2][MAX_PLY + 2];
+    int      pvLen[MAX_PLY + 2];
+    // result of the last COMPLETED iteration; read by the main thread once all threads have stopped
+    int      doneDepth = 0, doneScore = 0;
+    Move     doneBest;
+    Move     donePv[MAX_PLY + 2];
+    int      donePvLen = 0;
+
+    void clear() {
+        std::memset(pvLen, 0, sizeof(pvLen));
+        doneDepth = doneScore = donePvLen = 0;
+        doneBest = Move();
+        std::memset(history, 0, sizeof(history));
+        std::memset(contHist, 0, sizeof(contHist));
+        for (auto& row : counterMove) for (Move& m : row) m = Move();
+        for (auto& k : killers) k[0] = k[1] = Move();
+        std::memset(stkPt, 0, sizeof(stkPt));
+        for (int& t : stkTo) t = -1;
+        std::memset(evalStack, 0, sizeof(evalStack));
+        nodes = 0;
+        rootBestNodes = 0;
+    }
+};
+
+static std::vector<std::unique_ptr<ThreadData>> g_threads;
+
+void setThreads(int n) {                              // never call while a search is running
+    n = std::max(1, std::min(n, MAX_THREADS));
+    while ((int)g_threads.size() > n) g_threads.pop_back();
+    while ((int)g_threads.size() < n) {
+        auto t = std::make_unique<ThreadData>();
+        t->id = (int)g_threads.size();
+        t->clear();
+        g_threads.push_back(std::move(t));
+    }
+}
+int threadCount() { return std::max<int>(1, (int)g_threads.size()); }
+static void ensureThreads() { if (g_threads.empty()) setThreads(1); }
+
+static uint64_t totalNodes() {
+    uint64_t n = 0;
+    for (auto& t : g_threads) n += __atomic_load_n(&t->nodes, __ATOMIC_RELAXED);
+    return n;
+}
+
+static int  LMR[64][64];                 // [depth][moveCount]  (read-only after init)
 static const int NO_EVAL = -INF;         // "no static eval at this ply" (side was in check)
-static int  evalStack[MAX_PLY + 2];      // static eval per ply, for the "improving" flag
 static bool lmrReady = false;
 static bool printInfo = true;
 
@@ -175,13 +299,30 @@ static void initLMR() {
     lmrReady = true;
 }
 
+// Zeroing a multi-gigabyte table on one core takes seconds ("ucinewgame", "Clear Hash"): split it
+// over as many threads as the search uses once it is big enough to matter.
+static void clearTable() {
+    const size_t n = TT.size();
+    const int nt = (n * sizeof(Bucket) >= (64u << 20)) ? std::max(1, (int)g_threads.size()) : 1;
+    if (nt <= 1) {
+        std::fill(TT.begin(), TT.end(), Bucket());
+        return;
+    }
+    std::vector<std::thread> workers;
+    const size_t chunk = (n + nt - 1) / nt;
+    for (int i = 0; i < nt; ++i) {
+        const size_t lo = (size_t)i * chunk, hi = std::min(n, lo + chunk);
+        if (lo >= hi) break;
+        workers.emplace_back([lo, hi] { std::fill(TT.begin() + lo, TT.begin() + hi, Bucket()); });
+    }
+    for (auto& w : workers) w.join();
+}
+
 void clearTT() {
-    std::fill(TT.begin(), TT.end(), Bucket());
+    ensureThreads();
+    clearTable();
     ttAge = 0;
-    std::memset(history, 0, sizeof(history));
-    std::memset(contHist, 0, sizeof(contHist));
-    for (auto& row : counterMove) for (Move& m : row) m = Move();
-    for (auto& k : killers) k[0] = k[1] = Move();
+    for (auto& t : g_threads) t->clear();
 }
 
 void setSearchInfo(bool on) { printInfo = on; }
@@ -192,14 +333,22 @@ static int fromTT(int s, int ply) { return s >= MATE_BOUND ? s - ply : (s <= -MA
 
 // ---------- time control ----------
 struct Timeout {};
-static Clock::time_point deadline;
-static uint64_t nodes = 0;
 
-static inline void checkTime() {
-    if ((++nodes & 2047) == 0 && (stopFlag.load(std::memory_order_relaxed) || Clock::now() > deadline)) throw Timeout();
+// Every thread counts its own nodes and polls the stop flags; only the main thread reads the clock
+// and raises abortFlag so that all helpers unwind as well.
+static inline void checkTime(ThreadData& td) {
+    const uint64_t n = td.nodes + 1;
+    __atomic_store_n(&td.nodes, n, __ATOMIC_RELAXED);
+    if ((n & 2047) == 0) {
+        if (stopFlag.load(std::memory_order_relaxed) || abortFlag.load(std::memory_order_relaxed)) throw Timeout();
+        if (td.id == 0 && nowNs() > g_deadlineNs.load(std::memory_order_relaxed)) {
+            abortFlag = true;
+            throw Timeout();
+        }
+    }
 }
 
-uint64_t searchNodes() { return nodes; }
+uint64_t searchNodes() { return g_totalNodes; }
 
 static inline int sideIdx(const Board& b) { return b.sideToMove() == Color::WHITE ? 0 : 1; }
 
@@ -210,20 +359,20 @@ static inline void gravity(int& h, int bonus) {
 static inline int curIdx(int side, int pt, int to) { return (side * 6 + pt) * 64 + to; }
 
 // quiet move score: main history + countermove history (1 ply back) + follow-up history (2 plies back)
-static inline int histScore(int side, int ply, int pt, const Move& m) {
+static inline int histScore(ThreadData& td, int side, int ply, int pt, const Move& m) {
     const int to = m.to().index(), cur = curIdx(side, pt, to);
-    int s = history[side][m.from().index()][to];
-    if (stkTo[ply] >= 0)                s += contHist[0][stkPt[ply] * 64 + stkTo[ply]][cur];
-    if (ply >= 1 && stkTo[ply - 1] >= 0) s += contHist[1][stkPt[ply - 1] * 64 + stkTo[ply - 1]][cur];
+    int s = td.history[side][m.from().index()][to];
+    if (td.stkTo[ply] >= 0)                  s += td.contHist[0][td.stkPt[ply] * 64 + td.stkTo[ply]][cur];
+    if (ply >= 1 && td.stkTo[ply - 1] >= 0)  s += td.contHist[1][td.stkPt[ply - 1] * 64 + td.stkTo[ply - 1]][cur];
     return s;
 }
 
 // board must be in the position the move was played from
-static void updateQuiet(const Board& b, int side, int ply, const Move& m, int bonus) {
+static void updateQuiet(ThreadData& td, const Board& b, int side, int ply, const Move& m, int bonus) {
     const int pt = (int)b.at(m.from()).type(), to = m.to().index(), cur = curIdx(side, pt, to);
-    gravity(history[side][m.from().index()][to], bonus);
-    if (stkTo[ply] >= 0)                gravity(contHist[0][stkPt[ply] * 64 + stkTo[ply]][cur], bonus);
-    if (ply >= 1 && stkTo[ply - 1] >= 0) gravity(contHist[1][stkPt[ply - 1] * 64 + stkTo[ply - 1]][cur], bonus);
+    gravity(td.history[side][m.from().index()][to], bonus);
+    if (td.stkTo[ply] >= 0)                  gravity(td.contHist[0][td.stkPt[ply] * 64 + td.stkTo[ply]][cur], bonus);
+    if (ply >= 1 && td.stkTo[ply - 1] >= 0)  gravity(td.contHist[1][td.stkPt[ply - 1] * 64 + td.stkTo[ply - 1]][cur], bonus);
 }
 
 static int see(const Board& b, const Move& m);       // defined below
@@ -233,9 +382,9 @@ static int see(const Board& b, const Move& m);       // defined below
 // > losing captures (SEE < 0).
 // Only assigns scores; callers use pickMove() so we never sort the whole list.
 // useCont is false in quiescence, where the continuation context is not tracked.
-static void orderMoves(const Board& b, Movelist& moves, Move ttMove, int ply, bool useCont = true) {
+static void orderMoves(ThreadData& td, const Board& b, Movelist& moves, Move ttMove, int ply, bool useCont = true) {
     const int side = sideIdx(b);
-    const Move counter = (useCont && stkTo[ply] >= 0) ? counterMove[stkPt[ply]][stkTo[ply]] : Move();
+    const Move counter = (useCont && td.stkTo[ply] >= 0) ? td.counterMove[td.stkPt[ply]][td.stkTo[ply]] : Move();
     for (Move& m : moves) {
         int s;
         if (m == ttMove) {
@@ -255,15 +404,15 @@ static void orderMoves(const Board& b, Movelist& moves, Move ttMove, int ply, bo
             }
         } else if (m.typeOf() == Move::PROMOTION) {
             s = S_CAPTURE + 80;
-        } else if (m == killers[ply][0]) {
+        } else if (m == td.killers[ply][0]) {
             s = S_KILLER1;
-        } else if (m == killers[ply][1]) {
+        } else if (m == td.killers[ply][1]) {
             s = S_KILLER2;
         } else if (counter != Move() && m == counter) {
             s = S_COUNTER;
         } else {
-            if (useCont) s = histScore(side, ply, (int)b.at(m.from()).type(), m);
-            else         s = history[side][m.from().index()][m.to().index()];
+            if (useCont) s = histScore(td, side, ply, (int)b.at(m.from()).type(), m);
+            else         s = td.history[side][m.from().index()][m.to().index()];
             s = std::max(QUIET_MIN, std::min(s, QUIET_MAX));
         }
         m.setScore((int16_t)s);
@@ -340,8 +489,8 @@ static int see(const Board& b, const Move& m) {
 }
 
 // ---------- quiescence search ----------
-static int quiesce(Board& b, int alpha, int beta, int ply) {
-    checkTime();
+static int quiesce(ThreadData& td, Board& b, int alpha, int beta, int ply) {
+    checkTime(td);
     // isRepetition(1): a single earlier occurrence already counts as a draw inside the search
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || b.isRepetition(1)) return 0;
     if (ply >= MAX_PLY) return evalSide(b);
@@ -351,12 +500,13 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
 
     uint64_t key = b.hash();
     Move ttMove{};
-    if (const Entry* e = ttProbe(key)) {
-        ttMove = Move(e->move);
-        int s = fromTT(e->score, ply);
-        if (e->flag() == EXACT) return s;
-        if (e->flag() == LOWER && s >= beta) return s;
-        if (e->flag() == UPPER && s <= alpha) return s;
+    TTEntry e;
+    if (ttProbe(key, e)) {
+        ttMove = Move(e.move);
+        int s = fromTT(e.score, ply);
+        if (e.flag() == EXACT) return s;
+        if (e.flag() == LOWER && s >= beta) return s;
+        if (e.flag() == UPPER && s <= alpha) return s;
     }
 
     Movelist moves;
@@ -373,7 +523,7 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
         best = stand;
         movegen::legalmoves<movegen::MoveGenType::CAPTURE>(moves, b);
     }
-    orderMoves(b, moves, ttMove, ply, false);
+    orderMoves(td, b, moves, ttMove, ply, false);
 
     Move bestMove{};
     for (int i = 0; i < moves.size(); ++i) {
@@ -395,7 +545,8 @@ static int quiesce(Board& b, int alpha, int beta, int ply) {
         }
 
         b.makeMove(m);
-        int s = -quiesce(b, -beta, -alpha, ply + 1);
+        ttPrefetch(b.hash());
+        int s = -quiesce(td, b, -beta, -alpha, ply + 1);
         b.unmakeMove(m);
 
         if (s > best) { best = s; bestMove = m; }
@@ -418,14 +569,15 @@ static bool hasNonPawnMaterial(const Board& b) {
 }
 
 // ---------- main search: negamax + PVS + TT + NMP + LMR + killers/history ----------
-static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNull, Move excluded = Move()) {
-    checkTime();
+static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int ply, bool canNull, Move excluded = Move()) {
+    checkTime(td);
+    td.pvLen[ply] = ply;                              // empty PV until a move raises alpha in a PV node
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || b.isRepetition(1)) return 0;
     if (ply >= MAX_PLY) return evalSide(b);
 
     const bool inCheck = b.inCheck();
     if (inCheck) ++depth;
-    if (depth <= 0) return quiesce(b, alpha, beta, ply);
+    if (depth <= 0) return quiesce(td, b, alpha, beta, ply);
 
     const bool pvNode = beta - alpha > 1;
     // a singular-extension verification search: same position as its parent, one move excluded.
@@ -436,15 +588,16 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     const int alphaOrig = alpha;
     Move ttMove{};
     int ttScore = 0, ttDepth = -1, ttFlag = 0;
-    if (const Entry* e = singular ? nullptr : ttProbe(key)) {
-        ttMove = Move(e->move);
-        ttScore = fromTT(e->score, ply); ttDepth = e->depth; ttFlag = e->flag();
+    TTEntry e;
+    if (!singular && ttProbe(key, e)) {
+        ttMove = Move(e.move);
+        ttScore = fromTT(e.score, ply); ttDepth = e.depth; ttFlag = e.flag();
         // only cut in non-PV nodes: keeps the PV exact and avoids TT-induced oddities
-        if (!pvNode && e->depth >= depth) {
-            int s = fromTT(e->score, ply);
-            if (e->flag() == EXACT) return s;
-            if (e->flag() == LOWER && s >= beta) return s;
-            if (e->flag() == UPPER && s <= alpha) return s;
+        if (!pvNode && e.depth >= depth) {
+            int s = fromTT(e.score, ply);
+            if (e.flag() == EXACT) return s;
+            if (e.flag() == LOWER && s >= beta) return s;
+            if (e.flag() == UPPER && s <= alpha) return s;
         }
     }
 
@@ -476,20 +629,20 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
     int staticEval = NO_EVAL;
     if (!inCheck) staticEval = evalSide(b);
-    evalStack[ply] = staticEval;
+    td.evalStack[ply] = staticEval;
 
     // improving: our static eval is better than two plies ago (same side to move); fall back to four
     // plies ago if we were in check then. When improving we trust the position more and prune/reduce
     // less aggressively where it is risky, and more where it is safe (see each use below).
     bool improving = false;
     if (!inCheck) {
-        int prev = ply >= 2 ? evalStack[ply - 2] : NO_EVAL;
-        if (prev == NO_EVAL && ply >= 4) prev = evalStack[ply - 4];
+        int prev = ply >= 2 ? td.evalStack[ply - 2] : NO_EVAL;
+        if (prev == NO_EVAL && ply >= 4) prev = td.evalStack[ply - 4];
         improving = prev != NO_EVAL && staticEval > prev;
     }
 
     if (prunable && !singular && depth <= RAZOR_MAX_DEPTH && staticEval + RAZOR_BASE + RAZOR_MARGIN * depth <= alpha) {
-        const int v = quiesce(b, alpha - 1, alpha, ply);
+        const int v = quiesce(td, b, alpha - 1, alpha, ply);
         if (v < alpha) return v;
     }
 
@@ -502,9 +655,9 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     if (!pvNode && canNull && !inCheck && depth >= NMP_MIN_DEPTH &&
         std::abs(beta) < MATE_BOUND && hasNonPawnMaterial(b) && staticEval >= beta) {
         int R = 2 + depth / 4;
-        stkTo[ply + 1] = -1; stkPt[ply + 1] = 0;
+        td.stkTo[ply + 1] = -1; td.stkPt[ply + 1] = 0;
         b.makeNullMove();
-        int s = -negamax(b, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
+        int s = -negamax(td, b, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
         b.unmakeNullMove();
         if (s >= beta) return s >= MATE_BOUND ? beta : s;     // never trust unproven mate scores
     }
@@ -514,7 +667,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         if (!(ttDepth >= depth - 3 && ttFlag != LOWER && ttScore < probBeta)) {
             Movelist caps;
             movegen::legalmoves<movegen::MoveGenType::CAPTURE>(caps, b);
-            orderMoves(b, caps, ttMove, ply);
+            orderMoves(td, b, caps, ttMove, ply);
             for (int i = 0; i < caps.size(); ++i) {
                 pickMove(caps, i);
                 const Move m = caps[i];
@@ -522,10 +675,10 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
                 if (see(b,m) < probBeta - staticEval) continue;
                 const int movedPt = (int)b.at(m.from()).type();
                 b.makeMove(m);
-                stkPt[ply + 1] = movedPt; stkTo[ply + 1] = m.to().index();
-                int s = -quiesce(b, -probBeta, -probBeta + 1, ply + 1);
+                td.stkPt[ply + 1] = movedPt; td.stkTo[ply + 1] = m.to().index();
+                int s = -quiesce(td, b, -probBeta, -probBeta + 1, ply + 1);
                 if (s >= probBeta) {
-                    s = -negamax(b, depth - PROBCUT_REDUCTION, -probBeta, -probBeta + 1, ply + 1, true);
+                    s = -negamax(td, b, depth - PROBCUT_REDUCTION, -probBeta, -probBeta + 1, ply + 1, true);
                 }
                 b.unmakeMove(m);
                 if (s >= probBeta) {
@@ -539,7 +692,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
     Movelist moves;
     movegen::legalmoves(moves, b);
     if (moves.empty()) return inCheck ? -(MATE - ply) : 0;
-    orderMoves(b, moves, ttMove, ply);
+    orderMoves(td, b, moves, ttMove, ply);
 
     const int side = sideIdx(b);
     int best = tbFloor;
@@ -552,14 +705,14 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
         const Move m = moves[i];
         if (singular && m == excluded) continue;
         const bool quiet = !b.isCapture(m) && m.typeOf() != Move::PROMOTION;
-        const bool isKiller = m == killers[ply][0] || m == killers[ply][1];
+        const bool isKiller = m == td.killers[ply][0] || m == td.killers[ply][1];
         const int movedPt = (int)b.at(m.from()).type();
-        const int h = quiet ? histScore(side, ply, movedPt, m) : 0;
+        const int h = quiet ? histScore(td, side, ply, movedPt, m) : 0;
 
         int ext = 0;
         if (i == 0 && !singular && ply > 0 && depth >= SE_MIN_DEPTH && m == ttMove && ttFlag != UPPER && ttDepth >= depth - 3 && std::abs(ttScore) < MATE_BOUND) {
             const int sBeta = ttScore - SE_MARGIN * depth;
-            const int sv = negamax(b, (depth - 1 ) / 2, sBeta - 1, sBeta, ply, false, m);
+            const int sv = negamax(td, b, (depth - 1 ) / 2, sBeta - 1, sBeta, ply, false, m);
             if (sv < sBeta) ext = 1;
             else if (sBeta >= beta) return sBeta;
             else if (ttScore >= beta) ext = -1;
@@ -573,7 +726,7 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
                             !quiet && m.score() < 0 && see(b, m) < -SEE_PRUNE_MARGIN * depth;
 
         b.makeMove(m);
-        stkPt[ply + 1] = movedPt; stkTo[ply + 1] = m.to().index();
+        td.stkPt[ply + 1] = movedPt; td.stkTo[ply + 1] = m.to().index();
         if (seeBad && !b.inCheck()) {
             b.unmakeMove(m);
             continue;
@@ -590,9 +743,10 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
             }
         }
 
+        ttPrefetch(b.hash());                              // the child's first TT probe happens right below
         int s;
         if (i == 0) {
-            s = -negamax(b, depth - 1 + ext, -beta, -alpha, ply + 1, true);
+            s = -negamax(td, b, depth - 1 + ext, -beta, -alpha, ply + 1, true);
         } else {
             // late move reduction: late quiet moves are probably bad, so search them shallower
             int r = 0;
@@ -604,23 +758,31 @@ static int negamax(Board& b, int depth, int alpha, int beta, int ply, bool canNu
                 r -= h / 12288;                             // good combined history: reduce less, bad: more
                 r = std::max(0, std::min(r, depth - 2));
             }
-            s = -negamax(b, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true);
+            s = -negamax(td, b, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true);
             if (s > alpha && r > 0)                        // reduced search surprised us: verify at full depth
-                s = -negamax(b, depth - 1, -alpha - 1, -alpha, ply + 1, true);
+                s = -negamax(td, b, depth - 1, -alpha - 1, -alpha, ply + 1, true);
             if (s > alpha && s < beta)                     // PVS re-search with the full window
-                s = -negamax(b, depth - 1, -beta, -alpha, ply + 1, true);
+                s = -negamax(td, b, depth - 1, -beta, -alpha, ply + 1, true);
         }
         b.unmakeMove(m);
 
         if (s > best) { best = s; bestMove = m; }
-        if (s > alpha) alpha = s;
+        if (s > alpha) {
+            alpha = s;
+            if (pvNode) {                                  // this move + the child's line becomes our PV
+                td.pv[ply][ply] = m;
+                const int cl = td.pvLen[ply + 1];
+                for (int k = ply + 1; k < cl; ++k) td.pv[ply][k] = td.pv[ply + 1][k];
+                td.pvLen[ply] = cl;
+            }
+        }
         if (alpha >= beta) {
             if (quiet) {
-                if (!(m == killers[ply][0])) { killers[ply][1] = killers[ply][0]; killers[ply][0] = m; }
+                if (!(m == td.killers[ply][0])) { td.killers[ply][1] = td.killers[ply][0]; td.killers[ply][0] = m; }
                 int bonus = std::min(depth * depth, 1200);
-                updateQuiet(b, side, ply, m, bonus);
-                for (int q = 0; q < nq; ++q) updateQuiet(b, side, ply, quiets[q], -bonus);   // penalise quiets that failed
-                if (stkTo[ply] >= 0) counterMove[stkPt[ply]][stkTo[ply]] = m;
+                updateQuiet(td, b, side, ply, m, bonus);
+                for (int q = 0; q < nq; ++q) updateQuiet(td, b, side, ply, quiets[q], -bonus);   // penalise quiets that failed
+                if (td.stkTo[ply] >= 0) td.counterMove[td.stkPt[ply]][td.stkTo[ply]] = m;
             }
             break;
         }
@@ -643,26 +805,48 @@ static std::string scoreStr(int s) {
     return "cp " + std::to_string(s);
 }
 
-// ---------- root search (PVS) ----------
-static uint64_t rootBestNodes = 0;     // nodes spent on the current best root move (time management)
+// PV as a UCI string; falls back to the single best move if the stored line does not start with it.
+static std::string pvString(const Move* pv, int len, const Move& best) {
+    std::string s;
+    if (len > 0 && pv[0] == best) {
+        for (int i = 0; i < len; ++i) s += (i ? " " : "") + uci::moveToUci(pv[i]);
+    } else {
+        s = uci::moveToUci(best);
+    }
+    return s;
+}
 
-static int rootSearch(Board& b, Movelist& moves, int depth, int alpha, int beta, Move& best) {
-    orderMoves(b, moves, best, 0);
+// Remember the result of a finished iteration (used to pick the best thread at the end of the search).
+static void recordDone(ThreadData& td, int depth, int score, const Move& best) {
+    td.doneDepth = depth;
+    td.doneScore = score;
+    td.doneBest  = best;
+    int n = 0;
+    if (td.pvLen[0] > 0 && td.pv[0][0] == best) {
+        n = td.pvLen[0];
+        for (int i = 0; i < n; ++i) td.donePv[i] = td.pv[0][i];
+    }
+    td.donePvLen = n;
+}
+
+// ---------- root search (PVS) ----------
+static int rootSearch(ThreadData& td, Board& b, Movelist& moves, int depth, int alpha, int beta, Move& best) {
+    orderMoves(td, b, moves, best, 0);
     std::stable_sort(moves.begin(), moves.end(),
                      [](const Move& x, const Move& y) { return x.score() > y.score(); });
     int bestScore = -INF;
     bool first = true;
     for (const Move& m : moves) {
-        const uint64_t n0 = nodes;
-        stkPt[1] = (int)b.at(m.from()).type(); stkTo[1] = m.to().index();
+        const uint64_t n0 = td.nodes;
+        td.stkPt[1] = (int)b.at(m.from()).type(); td.stkTo[1] = m.to().index();
         b.makeMove(m);
         int s;
         if (first) {
-            s = -negamax(b, depth - 1, -beta, -alpha, 1, true);
+            s = -negamax(td, b, depth - 1, -beta, -alpha, 1, true);
         } else {
-            s = -negamax(b, depth - 1, -alpha - 1, -alpha, 1, true);
+            s = -negamax(td, b, depth - 1, -alpha - 1, -alpha, 1, true);
             if (s > alpha && s < beta)
-                s = -negamax(b, depth - 1, -beta, -alpha, 1, true);
+                s = -negamax(td, b, depth - 1, -beta, -alpha, 1, true);
         }
         b.unmakeMove(m);
         first = false;
@@ -671,11 +855,124 @@ static int rootSearch(Board& b, Movelist& moves, int depth, int alpha, int beta,
         if (s > alpha) {
             alpha = s;
             best = m;
-            rootBestNodes = nodes - n0;
+            td.rootBestNodes = td.nodes - n0;
+            td.pv[0][0] = m;
+            const int cl = td.pvLen[1];
+            for (int k = 1; k < cl; ++k) td.pv[0][k] = td.pv[1][k];
+            td.pvLen[0] = std::max(cl, 1);
             if (alpha >= beta) break;
         }
     }
     return bestScore;
+}
+
+// One iteration with aspiration windows (shared by the main thread and the helpers).
+// iterNodes is the node count of the final (successful) pass.
+static int aspirationSearch(ThreadData& td, Board& b, Movelist& moves, int d, int lastScore,
+                            Move& best, uint64_t& iterNodes) {
+    int alpha = -INF, beta = INF, delta = ASP_DELTA;
+    if (d >= ASP_MIN_DEPTH && std::abs(lastScore) < MATE_BOUND) {
+        alpha = std::max(lastScore - delta, -INF);
+        beta  = std::min(lastScore + delta,  INF);
+    }
+    int score;
+    while (true) {
+        const uint64_t n0 = td.nodes;
+        score = rootSearch(td, b, moves, d, alpha, beta, best);
+        iterNodes = td.nodes - n0;
+        if (score <= alpha) {
+            beta  = (alpha + beta) / 2;
+            alpha = std::max(score - delta, -INF);
+        } else if (score >= beta) {
+            beta = std::min(score + delta, INF);
+        } else {
+            break;
+        }
+        delta += delta / 2;
+        if (delta > ASP_MAX_DELTA) { alpha = -INF; beta = INF; }
+    }
+    return score;
+}
+
+// ---------- Lazy SMP helper thread ----------
+// Helpers search the same root with their own history tables and share only the transposition table.
+// To keep them from walking in lock-step they skip some iterations (different pattern per thread), so
+// at any moment the threads are working on a mix of depths and feed each other through the TT.
+// Helpers print nothing and never decide when to stop; the main thread aborts them.
+static const int SKIP_SIZE[20]  = {1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4};
+static const int SKIP_PHASE[20] = {0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7};
+
+static void helperMain(ThreadData& td, Board b, Movelist moves, int maxDepth) {
+    try {
+        Move best = moves[0];
+        td.stkTo[0] = -1; td.stkPt[0] = 0;
+        td.pvLen[0] = 0;
+        td.evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);
+        const int idx = (td.id - 1) % 20;
+        int prevScore = 0;
+        for (int d = 1; d <= maxDepth; ++d) {
+            if (abortFlag.load(std::memory_order_relaxed) || stopFlag.load(std::memory_order_relaxed)) break;
+            if (((d + SKIP_PHASE[idx]) / SKIP_SIZE[idx]) & 1) continue;
+            uint64_t iterNodes = 0;
+            prevScore = aspirationSearch(td, b, moves, d, prevScore, best, iterNodes);
+            recordDone(td, d, prevScore, best);
+            if (std::abs(prevScore) >= MATE_BOUND) break;
+        }
+    } catch (const Timeout&) {
+        // main thread asked everybody to stop
+    }
+}
+
+// ---------- choosing the final move among the threads ----------
+// Every thread votes for the best move of its last completed iteration. A vote is worth
+// (score - lowest thread score + 14) * depth, so deeper and better-scoring threads count more.
+// The main thread wins when it reached the requested depth, so "go depth N" stays deterministic in
+// meaning. Mate scores are not voted on: the thread with the best (shortest mate / longest defence)
+// score is taken. Returns the index of the thread whose result is played.
+static int pickBestThread(int maxDepth) {
+    const int n = (int)g_threads.size();
+    int first = -1;
+    for (int i = 0; i < n; ++i)
+        if (g_threads[i]->doneDepth > 0) { first = i; break; }
+    if (first < 0) return 0;
+    const ThreadData& mainTd = *g_threads[0];
+    if (mainTd.doneDepth >= maxDepth) return 0;
+
+    bool mate = mainTd.doneDepth > 0 && mainTd.doneScore <= -MATE_BOUND;
+    for (int i = 0; i < n; ++i)
+        if (g_threads[i]->doneDepth > 0 && g_threads[i]->doneScore >= MATE_BOUND) mate = true;
+    int best = first;
+    if (mate) {
+        for (int i = 0; i < n; ++i)
+            if (g_threads[i]->doneDepth > 0 && g_threads[i]->doneScore > g_threads[best]->doneScore) best = i;
+        return best;
+    }
+
+    int minScore = INF;
+    for (int i = 0; i < n; ++i)
+        if (g_threads[i]->doneDepth > 0) minScore = std::min(minScore, g_threads[i]->doneScore);
+
+    struct Vote { uint16_t mv; int64_t v; };
+    std::vector<Vote> votes;
+    for (int i = 0; i < n; ++i) {
+        const ThreadData& t = *g_threads[i];
+        if (t.doneDepth <= 0) continue;
+        const int64_t w = (int64_t)(t.doneScore - minScore + 14) * t.doneDepth;
+        const uint16_t mv = t.doneBest.move();
+        bool found = false;
+        for (Vote& x : votes) if (x.mv == mv) { x.v += w; found = true; break; }
+        if (!found) votes.push_back({mv, w});
+    }
+    auto votesFor = [&](const Move& m) -> int64_t {
+        for (const Vote& x : votes) if (x.mv == m.move()) return x.v;
+        return 0;
+    };
+    for (int i = 0; i < n; ++i) {
+        const ThreadData& t = *g_threads[i];
+        if (t.doneDepth <= 0) continue;
+        if (votesFor(t.doneBest) > votesFor(g_threads[best]->doneBest)) best = i;   // ties keep the lower index
+    }
+    return best;
 }
 
 // ---------- iterative deepening with aspiration windows and time management ----------
@@ -686,12 +983,31 @@ static const double STAB_SCALE[9] = {1.40, 1.20, 1.05, 0.95, 0.88, 0.82, 0.78, 0
 // Note: on timeout the board passed in is left mid-search, so callers must pass a copy.
 Move search(Board& b, const SearchLimits& lim) {
     initLMR();
-    auto start = Clock::now();
-    deadline = start + std::chrono::milliseconds(lim.hardMs);
-    nodes = 0;
+    ensureThreads();
+    const int64_t startNs = nowNs();
+    {
+        std::lock_guard<std::mutex> lk(g_timeMx);
+        g_hardNs = lim.hardMs * 1000000LL;
+        g_softNs = lim.softMs * 1000000LL;
+        g_searchStartNs = startNs;
+        // while pondering there is no hard limit; ponderHit() installs it later
+        g_deadlineNs = g_pondering.load() ? INT64_MAX : startNs + g_hardNs;
+    }
+    abortFlag = false;
+    g_totalNodes = 0;
+    g_lastPv.clear();                               // early returns below leave "no PV"
+    const uint64_t rootKey = b.hash();              // b is left mid-search after a timeout
     ttAge = (ttAge + 1) & 63;                       // new search = new TT generation
-    for (auto& k : killers) k[0] = k[1] = Move();
-    for (auto& s : history) for (auto& f : s) for (int& h : f) h /= 2;   // age, don't wipe
+    for (auto& up : g_threads) {
+        ThreadData& t = *up;
+        t.nodes = 0;
+        t.rootBestNodes = 0;
+        t.pvLen[0] = 0;
+        t.doneDepth = t.doneScore = t.donePvLen = 0;
+        t.doneBest = Move();
+        for (auto& k : t.killers) k[0] = k[1] = Move();
+        for (auto& s : t.history) for (auto& f : s) for (int& h : f) h /= 2;   // age, don't wipe
+    }
 
     Movelist moves;
     movegen::legalmoves(moves, b);
@@ -714,52 +1030,42 @@ Move search(Board& b, const SearchLimits& lim) {
         }
     }
 
+    ThreadData& td = *g_threads[0];
     Move best = moves[0], prevBest = best;
     int prevScore = 0, stability = 0;
-    stkTo[0] = -1; stkPt[0] = 0;                            // no move led into the root
-    evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);     // root eval, read by plies 2 and 4
+    td.stkTo[0] = -1; td.stkPt[0] = 0;                            // no move led into the root
+    td.evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);        // root eval, read by plies 2 and 4
+
+    // Lazy SMP: start the helpers on copies of the root position (after the TB filter above)
+    std::vector<std::thread> helpers;
+    for (int i = 1; i < (int)g_threads.size(); ++i)
+        helpers.emplace_back(helperMain, std::ref(*g_threads[i]), b, moves, lim.maxDepth);
 
     for (int d = 1; d <= lim.maxDepth; ++d) {
         try {
             const int lastScore = prevScore;
-            int alpha = -INF, beta = INF, delta = ASP_DELTA;
-            if (d >= ASP_MIN_DEPTH && std::abs(lastScore) < MATE_BOUND) {
-                alpha = std::max(lastScore - delta, -INF);
-                beta  = std::min(lastScore + delta,  INF);
-            }
-
-            int score;
             uint64_t iterNodes = 0;
-            while (true) {
-                const uint64_t n0 = nodes;
-                score = rootSearch(b, moves, d, alpha, beta, best);
-                iterNodes = nodes - n0;
-                if (score <= alpha) {
-                    beta  = (alpha + beta) / 2;
-                    alpha = std::max(score - delta, -INF);
-                } else if (score >= beta) {
-                    beta = std::min(score + delta, INF);
-                } else {
-                    break;
-                }
-                delta += delta / 2;
-                if (delta > ASP_MAX_DELTA) { alpha = -INF; beta = INF; }
-            }
+            const int score = aspirationSearch(td, b, moves, d, lastScore, best, iterNodes);
+            recordDone(td, d, score, best);
 
             prevScore = score;
-            const long long t = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+            const int64_t now = nowNs();
+            const long long t = (now - startNs) / 1000000;
             if (printInfo) {
+                const uint64_t total = totalNodes();
                 std::cout << "info depth " << d << " score " << scoreStr(score)
-                          << " nodes " << nodes << " nps " << (t > 0 ? nodes * 1000 / t : nodes)
+                          << " nodes " << total << " nps " << (t > 0 ? total * 1000 / t : total)
                           << " hashfull " << hashfull() << " time " << t
-                          << " pv " << uci::moveToUci(best) << std::endl;
+                          << " pv " << pvString(td.pv[0], td.pvLen[0], best) << std::endl;
             }
             if (score >= MATE_BOUND) break;
 
             // ---- time management ----
             stability = (d >= 2 && best == prevBest) ? std::min(stability + 1, 8) : 0;
             prevBest = best;
-            if (!lim.infinite) {
+            // while pondering there is no clock; after "ponderhit" the time spent pondering counts too
+            // (t is measured from the start of the search), so a long ponder lets us move at once
+            if (!lim.infinite && !g_pondering.load()) {
                 double target = (double)lim.softMs;
                 if (lim.dynamic && d >= 6) {
                     double scale = STAB_SCALE[stability];                       // same move for long -> less time
@@ -767,7 +1073,7 @@ Move search(Board& b, const SearchLimits& lim) {
                     if (drop > 0)        scale *= 1.0 + std::min(drop, 80) * 0.006;   // score falling -> think more
                     else if (drop < -20) scale *= 0.95;                         // clearly improving -> relax
                     if (d >= 8 && iterNodes > 0) {                              // one dominant root move -> less time
-                        double frac = (double)rootBestNodes / (double)iterNodes;
+                        double frac = (double)td.rootBestNodes / (double)iterNodes;
                         scale *= std::max(0.7, std::min(1.5, 1.7 - frac));
                     }
                     scale = std::max(0.4, std::min(scale, 2.5));
@@ -779,15 +1085,93 @@ Move search(Board& b, const SearchLimits& lim) {
             break;
         }
     }
-    return best;
+
+    abortFlag = true;                                 // tell the helpers to unwind, then wait for them
+    for (auto& h : helpers) h.join();
+    g_totalNodes = totalNodes();
+
+    // Lazy SMP: the threads vote on the move to play (the main thread's live result if it wins, since it
+    // may have improved on its last completed iteration)
+    const int pick = pickBestThread(lim.maxDepth);
+    Move result = best;
+    g_lastPvKey = rootKey;
+    if (pick == 0) {
+        if (td.pvLen[0] > 0 && td.pv[0][0] == best) g_lastPv.assign(td.pv[0], td.pv[0] + td.pvLen[0]);
+    } else {
+        const ThreadData& t = *g_threads[pick];
+        result = t.doneBest;
+        g_lastPv.assign(t.donePv, t.donePv + t.donePvLen);
+        if (printInfo)
+            std::cout << "info depth " << t.doneDepth << " score " << scoreStr(t.doneScore)
+                      << " nodes " << g_totalNodes << " pv " << pvString(t.donePv, t.donePvLen, t.doneBest) << std::endl;
+    }
+    return result;
 }
 
 // Convenience overload: fixed depth and a single time budget (terminal play, bench).
 Move search(Board& b, int maxDepth, int ms) {
+    setPondering(false);
     SearchLimits lim;
     lim.maxDepth = maxDepth;
     lim.hardMs = ms;
     lim.softMs = (int64_t)(ms * 0.6);
     lim.dynamic = true;
     return search(b, lim);
+}
+
+// Last resort for the ponder move (forced moves, tablebase roots, book moves have no PV): a tiny
+// search of the position after our move, at most ~30 ms. Only called when no search is running.
+static Move quickReply(const Board& after) {
+    Movelist moves;
+    movegen::legalmoves(moves, after);
+    if (moves.empty()) return Move();
+    if (moves.size() == 1) return moves[0];
+    ensureThreads();
+    ThreadData& td = *g_threads[0];
+    Board b = after;
+    td.stkTo[0] = -1; td.stkPt[0] = 0;
+    td.evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);
+    abortFlag = false;                                // the finished search left it set
+    g_deadlineNs = nowNs() + 30000000LL;
+    Move best = moves[0];
+    int score = 0;
+    try {
+        for (int d = 1; d <= 8; ++d) {
+            uint64_t iterNodes = 0;
+            score = aspirationSearch(td, b, moves, d, score, best, iterNodes);
+            if (std::abs(score) >= MATE_BOUND) break;
+        }
+    } catch (const Timeout&) {
+        // time is up: use what the last iterations found
+    }
+    return best;
+}
+
+// The reply we expect after `best`, for the "ponder" part of "bestmove". `root` is the position `best`
+// was searched from. Sources, in order: the PV of the search that chose `best`, the transposition table,
+// a quick search. Returns Move() if nothing usable is found.
+Move ponderMoveFor(const Board& root, Move best) {
+    if (best == Move()) return Move();
+    Board b = root;
+    b.makeMove(best);
+    Movelist legal;
+    movegen::legalmoves(legal, b);
+    if (legal.empty()) return Move();
+    auto legalMatch = [&](const Move& c) -> Move {
+        for (const Move& m : legal)
+            if (m == c) return m;
+        return Move();
+    };
+
+    if (g_lastPvKey == root.hash() && g_lastPv.size() >= 2 && g_lastPv[0] == best) {
+        const Move m = legalMatch(g_lastPv[1]);
+        if (!(m == Move())) return m;
+    }
+    TTEntry e;
+    if (ttProbe(b.hash(), e) && e.move != 0) {
+        const Move m = legalMatch(Move(e.move));
+        if (!(m == Move())) return m;
+    }
+    if (stopRequested()) return Move();
+    return quickReply(b);
 }

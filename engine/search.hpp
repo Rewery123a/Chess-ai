@@ -33,5 +33,26 @@ void setSearchInfo(bool on);
 void requestStop();
 void resetStop();
 
-// Number of nodes visited by the most recent search (used by "bench").
+// Number of nodes visited by the most recent search, all threads together (used by "bench").
 uint64_t searchNodes();
+
+// ---- Lazy SMP ----
+// Number of search threads (UCI "Threads"). All threads share the transposition table; the calling
+// thread of search() is thread 0 and the others are started per search. Never call while searching.
+void setThreads(int n);
+int  threadCount();
+
+// ---- Pondering ----
+// Call setPondering(true) BEFORE starting a "go ponder" search. While it is on, the search has no
+// time limit (it behaves like "go infinite" but still plays normally afterwards). ponderHit() turns
+// it into an ordinary timed search whose clock starts at that moment. A stop request ends it too.
+void setPondering(bool on);
+bool isPondering();
+void ponderHit();
+bool stopRequested();
+
+// The move we expect the opponent to answer `best` with, for the "ponder" part of "bestmove".
+// `root` is the position `best` was played from. Uses the PV of the last search, then the
+// transposition table, then a very short search (so call it after the search has finished).
+// Returns Move() if no legal reply is found.
+chess::Move ponderMoveFor(const chess::Board& root, chess::Move best);

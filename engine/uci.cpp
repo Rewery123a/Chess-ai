@@ -29,7 +29,9 @@ static const char* BENCH_FENS[] = {
 void runBench(int depth) {
     tbSetEnabled(false);                             // tablebases off so bench node counts stay fixed
     const size_t oldHash = hashSizeMB();             // NEW (first lines)
+    const int oldThreads = threadCount();
     setHashSize(16);                                 // NEW: fixed table size so bench numbers don't depend on Hash
+    setThreads(1);                                   // one thread: multi-threaded node counts are not reproducible
     setSearchInfo(false);
     uint64_t total = 0;
     auto t0 = std::chrono::steady_clock::now();
@@ -44,6 +46,7 @@ void runBench(int depth) {
               << (long long)(total / (ms / 1000.0)) << std::endl;
     setSearchInfo(true);
     setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
+    setThreads(oldThreads);
     tbSetEnabled(true);
 }
 
@@ -65,16 +68,32 @@ static void allocateTime(int64_t clock, int64_t inc, int movestogo, int overhead
     lim.dynamic = true;
 }
 
+static bool g_ponderOption = false;     // UCI option "Ponder": only then do we append "ponder <move>"
+
+// While "go ponder" has not been confirmed (ponderhit) or cancelled (stop), UCI forbids sending bestmove.
+static void waitWhilePondering() {
+    while (isPondering() && !stopRequested())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
 // Runs on its own thread so the main loop can still read "stop" / "quit" while thinking.
 static void thinkAndReply(Board work, SearchLimits lim) {
-    std::string bm = bookMove(work);
-    if (!bm.empty()) {
-        std::cout << "bestmove " << bm << std::endl;
+    const Board root = work;             // search() leaves its board mid-search on timeout
+    Move m;
+    const std::string bm = bookMove(work);
+    if (!bm.empty()) m = uci::uciToMove(root, bm);     // book move: no search, the ponder move comes from a quick one
+    else             m = search(work, lim);
+    waitWhilePondering();                // search may finish early (forced move, mate, depth limit) while pondering
+    if (m == Move()) {
+        std::cout << "bestmove 0000" << std::endl;
         return;
     }
-    Move m = search(work, lim);
-    if (m == Move()) std::cout << "bestmove 0000" << std::endl;
-    else std::cout << "bestmove " << uci::moveToUci(m) << std::endl;
+    std::cout << "bestmove " << uci::moveToUci(m);
+    if (g_ponderOption) {
+        const Move p = ponderMoveFor(root, m);
+        if (!(p == Move())) std::cout << " ponder " << uci::moveToUci(p);
+    }
+    std::cout << std::endl;
 }
 
 void uciLoop() {
@@ -98,6 +117,8 @@ void uciLoop() {
                       << "option name BookFile type string default Perfect2023.bin\n"
                       << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
                       << "option name Hash type spin default 64 min 1 max 65536\n"
+                      << "option name Threads type spin default 1 min 1 max 256\n"
+                      << "option name Ponder type check default false\n"
                       << "option name Clear Hash type button\n"
                       << "option name SyzygyPath type string default syzygy\n"
                       << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n"
@@ -116,6 +137,11 @@ void uciLoop() {
             } else if (name == "Hash") {
                 finishSearch();                          // the table must not be resized mid-search
                 setHashSize((size_t)std::max(1, std::atoi(value.c_str())));
+            } else if (name == "Threads") {
+                finishSearch();                          // helper state must not change under a running search
+                setThreads(std::atoi(value.c_str()));
+            } else if (name == "Ponder") {
+                g_ponderOption = (value == "true");
             } else if (name == "SyzygyPath") {
                 finishSearch();                          // never swap tables under a running search
                 if (!tbInit(value)) std::cerr << "Warning: no Syzygy tables found in '" << value << "'" << std::endl;
@@ -148,7 +174,7 @@ void uciLoop() {
         } else if (cmd == "go") {
             finishSearch();
             int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, movestogo = -1, depth = 64;
-            bool depthGiven = false, infinite = false;
+            bool depthGiven = false, infinite = false, ponder = false;
             std::string tok;
             while (ss >> tok) {
                 if (tok == "wtime") ss >> wtime;
@@ -159,6 +185,7 @@ void uciLoop() {
                 else if (tok == "movetime") ss >> movetime;
                 else if (tok == "depth") { ss >> depth; depthGiven = true; }
                 else if (tok == "infinite") infinite = true;
+                else if (tok == "ponder") ponder = true;
             }
 
             SearchLimits lim;
@@ -175,7 +202,11 @@ void uciLoop() {
             }
 
             resetStop();
+            setPondering(ponder);                // before the worker starts, so an early "ponderhit" is not lost
             worker = std::thread(thinkAndReply, board, lim);
+
+        } else if (cmd == "ponderhit") {
+            ponderHit();                         // the opponent played our predicted move: start the clock
 
         } else if (cmd == "bench") {
             int d = 0;
@@ -183,7 +214,8 @@ void uciLoop() {
             if (d <= 0) d = 9;
             finishSearch();
             resetStop();
-            runBench(d); 
+            setPondering(false);
+            runBench(d);
                
         } else if (cmd == "stop") {
             finishSearch();                       // the worker prints "bestmove" as it unwinds
