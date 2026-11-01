@@ -33,10 +33,5 @@ void setSearchInfo(bool on);
 void requestStop();
 void resetStop();
 
-// Number of search threads (UCI "Threads"). 1 = single-threaded; more = Lazy SMP helpers sharing the
-// transposition table. Never call while a search is running.
-void setThreads(int n);
-int  threadCount();
-
-// Number of nodes visited by the most recent search, all threads together (used by "bench").
+// Number of nodes visited by the most recent search (used by "bench").
 uint64_t searchNodes();

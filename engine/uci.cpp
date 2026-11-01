@@ -27,8 +27,7 @@ static const char* BENCH_FENS[] = {
     "3r2k1/p4ppp/1p6/8/2P5/1P3P2/P5PP/3R2K1 w - - 0 1"};
 
 void runBench(int depth) {
-    const int oldThreads = threadCount();
-    setThreads(1);                                   // one thread so bench node counts are deterministic
+    const bool oldTb = tbEnabled();
     tbSetEnabled(false);                             // tablebases off so bench node counts stay fixed
     const size_t oldHash = hashSizeMB();             // NEW (first lines)
     setHashSize(16);                                 // NEW: fixed table size so bench numbers don't depend on Hash
@@ -46,8 +45,7 @@ void runBench(int depth) {
               << (long long)(total / (ms / 1000.0)) << std::endl;
     setSearchInfo(true);
     setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
-    tbSetEnabled(true);
-    setThreads(oldThreads);
+    tbSetEnabled(oldTb);
 }
 
 // Splits the clock into a soft target and a hard cap for this move.
@@ -102,7 +100,6 @@ void uciLoop() {
                       << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
                       << "option name Hash type spin default 64 min 1 max 65536\n"
                       << "option name Clear Hash type button\n"
-                      << "option name Threads type spin default 1 min 1 max 256\n"
                       << "option name SyzygyPath type string default syzygy\n"
                       << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n"
                       << "uciok" << std::endl;
@@ -120,9 +117,6 @@ void uciLoop() {
             } else if (name == "Hash") {
                 finishSearch();                          // the table must not be resized mid-search
                 setHashSize((size_t)std::max(1, std::atoi(value.c_str())));
-            } else if (name == "Threads") {
-                finishSearch();                          // never change the thread count mid-search
-                setThreads(std::atoi(value.c_str()));
             } else if (name == "SyzygyPath") {
                 finishSearch();                          // never swap tables under a running search
                 if (!tbInit(value)) std::cerr << "Warning: no Syzygy tables found in '" << value << "'" << std::endl;
