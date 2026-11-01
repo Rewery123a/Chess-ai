@@ -338,19 +338,20 @@ int evaluate(const Board& b) {
 // The evaluation depends only on the position, and the search keeps meeting the same positions again.
 // Index = low hash bits, check = high 32 bits.
 namespace {
-struct EvalEntry { uint32_t check; int32_t score; };
+// One 64-bit word per slot: (check << 32) | score. A single word means search threads sharing the cache
+// can never read a half-written entry.
 constexpr size_t EVAL_CACHE_SIZE = 1 << 20;                      // 8 MB
-std::vector<EvalEntry> evalCache(EVAL_CACHE_SIZE, EvalEntry{0, 0});
+std::vector<uint64_t> evalCache(EVAL_CACHE_SIZE, 0);
 }
 
 int evalSide(const Board& b) {
     const uint64_t key = b.hash();
-    EvalEntry& e = evalCache[key & (EVAL_CACHE_SIZE - 1)];
+    uint64_t& slot = evalCache[key & (EVAL_CACHE_SIZE - 1)];
     const uint32_t check = (uint32_t)(key >> 32) | 1u;           // "| 1" keeps an empty slot from matching
-    if (e.check == check) return e.score;
+    const uint64_t e = __atomic_load_n(&slot, __ATOMIC_RELAXED);
+    if ((uint32_t)(e >> 32) == check) return (int32_t)(uint32_t)e;
     int s = evaluate(b);
     s = (b.sideToMove() == Color::WHITE ? s : -s) + TEMPO;
-    e.check = check;
-    e.score = s;
+    __atomic_store_n(&slot, ((uint64_t)check << 32) | (uint32_t)(int32_t)s, __ATOMIC_RELAXED);
     return s;
 }
