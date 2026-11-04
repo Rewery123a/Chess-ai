@@ -243,6 +243,14 @@ struct ThreadData {
     // the move that led INTO each ply (stkTo < 0: none, e.g. root or after a null move)
     int      stkPt[MAX_PLY + 2], stkTo[MAX_PLY + 2];
     int      evalStack[MAX_PLY + 2];              // static eval per ply, for the "improving" flag
+    // NNUE: one accumulator per ply, updated lazily. delta[p] describes the move that led INTO ply p and
+    // accValid[p] says acc[p] already includes it (acc[0] is built from scratch at the root).
+    struct FeatureRef { int8_t colour, pt, sq; };
+    struct AccDelta { int nsub = 0, nadd = 0; FeatureRef sub[2], add[2]; };
+    nnue::Accumulator acc[MAX_PLY + 2];
+    AccDelta delta[MAX_PLY + 2];
+    bool     accValid[MAX_PLY + 2];
+    bool     useNN = false;                       // a net is loaded: evaluate with it
     // principal variation (triangular table): pv[ply][ply .. pvLen[ply]-1] is the line found from that ply
     Move     pv[MAX_PLY + 2][MAX_PLY + 2];
     int      pvLen[MAX_PLY + 2];
@@ -270,6 +278,84 @@ struct ThreadData {
 };
 
 static std::vector<std::unique_ptr<ThreadData>> g_threads;
+
+// ---------- NNUE accumulator handling ----------
+// Call accSetMove BEFORE b.makeMove(m) (it reads the position the move is played from); `ply` is the ply of the
+// position AFTER the move. Nothing is computed until a node actually needs its static eval (evalAt).
+static inline void accSetMove(ThreadData& td, const Board& b, const Move m, int ply) {
+    if (!td.useNN) return;
+    ThreadData::AccDelta& d = td.delta[ply];
+    td.accValid[ply] = false;
+    const int us = b.sideToMove() == Color::WHITE ? 0 : 1;
+    const int from = m.from().index(), to = m.to().index();
+    const int pt = (int)b.at(m.from()).type();
+    const int type = m.typeOf();
+    d.nsub = d.nadd = 0;
+    auto sub = [&](int c, int p, int sq) { d.sub[d.nsub++] = {(int8_t)c, (int8_t)p, (int8_t)sq}; };
+    auto add = [&](int c, int p, int sq) { d.add[d.nadd++] = {(int8_t)c, (int8_t)p, (int8_t)sq}; };
+    if (type == Move::CASTLING) {                      // encoded as "king takes own rook"
+        const bool kingSide = to > from;
+        const int rank = from & ~7;
+        sub(us, 5, from); sub(us, 3, to);
+        add(us, 5, rank + (kingSide ? 6 : 2)); add(us, 3, rank + (kingSide ? 5 : 3));
+    } else if (type == Move::ENPASSANT) {
+        sub(us, 0, from); sub(us ^ 1, 0, us == 0 ? to - 8 : to + 8); add(us, 0, to);
+    } else {
+        const int victim = (int)b.at(m.to()).type();   // 6 = empty square
+        sub(us, pt, from);
+        if (victim <= 5) sub(us ^ 1, victim, to);
+        add(us, type == Move::PROMOTION ? (int)m.promotionType() : pt, to);
+    }
+}
+
+static inline void accSetNull(ThreadData& td, int ply) {   // null move: same pieces, other side to move
+    if (!td.useNN) return;
+    td.accValid[ply] = false;
+    td.delta[ply].nsub = td.delta[ply].nadd = 0;
+}
+
+static void accUpdateTo(ThreadData& td, int ply) {
+    int k = ply;
+    while (k > 0 && !td.accValid[k]) --k;
+    for (int j = k + 1; j <= ply; ++j) {
+        nnue::copy(td.acc[j], td.acc[j - 1]);
+        const ThreadData::AccDelta& d = td.delta[j];
+        for (int i = 0; i < d.nsub; ++i)
+            for (int p = 0; p < 2; ++p) nnue::subFeature(td.acc[j], p, nnue::featureIndex(p, d.sub[i].colour, d.sub[i].pt, d.sub[i].sq));
+        for (int i = 0; i < d.nadd; ++i)
+            for (int p = 0; p < 2; ++p) nnue::addFeature(td.acc[j], p, nnue::featureIndex(p, d.add[i].colour, d.add[i].pt, d.add[i].sq));
+        td.accValid[j] = true;
+    }
+}
+
+// static eval from the side to move's point of view (net if loaded, else the handcrafted eval)
+static inline int evalAt(ThreadData& td, const Board& b, int ply) {
+    if (!td.useNN) return evalSide(b);
+    accUpdateTo(td, ply);
+#ifdef NNUE_VERIFY
+    {
+        nnue::Accumulator ref;
+        nnueRefresh(b, ref);
+        for (int p = 0; p < 2; ++p)
+            if (std::memcmp(ref.v[p], td.acc[ply].v[p], (size_t)nnue::hiddenSize() * sizeof(int16_t)) != 0) {
+                std::cerr << "NNUE accumulator mismatch at ply " << ply << " fen " << b.getFen() << std::endl;
+                std::abort();
+            }
+    }
+#endif
+    const int s = nnue::evaluate(td.acc[ply], b.sideToMove() == Color::WHITE ? 0 : 1);
+    return std::max(-20000, std::min(20000, s));
+}
+
+// root: build acc[0] from scratch and return the root's static eval
+static int rootEval(ThreadData& td, const Board& b) {
+    td.useNN = nnue::loaded();
+    if (td.useNN) {
+        nnueRefresh(b, td.acc[0]);
+        td.accValid[0] = true;
+    }
+    return b.inCheck() ? -INF : evalAt(td, b, 0);
+}
 
 void setThreads(int n) {                              // never call while a search is running
     n = std::max(1, std::min(n, MAX_THREADS));
@@ -510,7 +596,7 @@ static int quiesce(ThreadData& td, Board& b, int alpha, int beta, int ply) {
     checkTime(td);
     // isRepetition(1): a single earlier occurrence already counts as a draw inside the search
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || b.isRepetition(1)) return 0;
-    if (ply >= MAX_PLY) return evalSide(b);
+    if (ply >= MAX_PLY) return evalAt(td, b, ply);
 
     const bool inCheck = b.inCheck();
     const int alphaOrig = alpha;
@@ -533,7 +619,7 @@ static int quiesce(ThreadData& td, Board& b, int alpha, int beta, int ply) {
         if (moves.empty()) return -(MATE - ply);
         best = -INF;
     } else {
-        stand = evalSide(b);
+        stand = evalAt(td, b, ply);
         if (stand >= beta) return stand;
         if (stand + BIG_DELTA < alpha) return stand + BIG_DELTA;
         if (stand > alpha) alpha = stand;
@@ -561,6 +647,7 @@ static int quiesce(ThreadData& td, Board& b, int alpha, int beta, int ply) {
                 (m == ttMove ? see(b, m) < 0 : m.score() < 0)) continue;
         }
 
+        accSetMove(td, b, m, ply + 1);
         b.makeMove(m);
         ttPrefetch(b.hash());
         int s = -quiesce(td, b, -beta, -alpha, ply + 1);
@@ -590,7 +677,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     checkTime(td);
     td.pvLen[ply] = ply;                              // empty PV until a move raises alpha in a PV node
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || b.isRepetition(1)) return 0;
-    if (ply >= MAX_PLY) return evalSide(b);
+    if (ply >= MAX_PLY) return evalAt(td, b, ply);
 
     // mate distance pruning: no line from here can score better than mating on the next ply, or
     // worse than being mated right now. If that already closes the window, a shorter mate was found
@@ -654,7 +741,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     // static eval for every node that is not in check (PV nodes too: they feed "improving" below)
     const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
     int staticEval = NO_EVAL;
-    if (!inCheck) staticEval = evalSide(b);
+    if (!inCheck) staticEval = evalAt(td, b, ply);
     td.evalStack[ply] = staticEval;
 
     // improving: our static eval is better than two plies ago (same side to move); fall back to four
@@ -682,6 +769,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         std::abs(beta) < MATE_BOUND && hasNonPawnMaterial(b) && staticEval >= beta) {
         int R = 2 + depth / 4;
         td.stkTo[ply + 1] = -1; td.stkPt[ply + 1] = 0;
+        accSetNull(td, ply + 1);
         b.makeNullMove();
         int s = -negamax(td, b, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
         b.unmakeNullMove();
@@ -700,6 +788,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
                 if (!b.isCapture(m) && m.typeOf() != Move::PROMOTION) continue;
                 if (see(b,m) < probBeta - staticEval) continue;
                 const int movedPt = (int)b.at(m.from()).type();
+                accSetMove(td, b, m, ply + 1);
                 b.makeMove(m);
                 td.stkPt[ply + 1] = movedPt; td.stkTo[ply + 1] = m.to().index();
                 int s = -quiesce(td, b, -probBeta, -probBeta + 1, ply + 1);
@@ -758,6 +847,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         const bool seeBad = prunable && i > 0 && depth <= SEE_PRUNE_MAX_DEPTH && best > -MATE_BOUND &&
                             !quiet && m.score() < 0 && see(b, m) < -SEE_PRUNE_MARGIN * depth;
 
+        accSetMove(td, b, m, ply + 1);
         b.makeMove(m);
         td.stkPt[ply + 1] = movedPt; td.stkTo[ply + 1] = m.to().index();
         if (seeBad && !b.inCheck()) {
@@ -882,6 +972,7 @@ static int rootSearch(ThreadData& td, Board& b, Movelist& moves, int depth, int 
     for (const Move& m : moves) {
         const uint64_t n0 = td.nodes;
         td.stkPt[1] = (int)b.at(m.from()).type(); td.stkTo[1] = m.to().index();
+        accSetMove(td, b, m, 1);
         b.makeMove(m);
         int s;
         if (first) {
@@ -950,7 +1041,7 @@ static void helperMain(ThreadData& td, Board b, Movelist moves, int maxDepth) {
         Move best = moves[0];
         td.stkTo[0] = -1; td.stkPt[0] = 0;
         td.pvLen[0] = 0;
-        td.evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);
+        td.evalStack[0] = rootEval(td, b);
         const int idx = (td.id - 1) % 20;
         int prevScore = 0;
         for (int d = 1; d <= maxDepth; ++d) {
@@ -1078,7 +1169,7 @@ Move search(Board& b, const SearchLimits& lim) {
     Move best = moves[0], prevBest = best;
     int prevScore = 0, stability = 0;
     td.stkTo[0] = -1; td.stkPt[0] = 0;                            // no move led into the root
-    td.evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);        // root eval, read by plies 2 and 4
+    td.evalStack[0] = rootEval(td, b);        // root eval, read by plies 2 and 4
 
     // Lazy SMP: start the helpers on copies of the root position (after the TB filter above)
     std::vector<std::thread> helpers;
@@ -1174,7 +1265,7 @@ static Move quickReply(const Board& after) {
     ThreadData& td = *g_threads[0];
     Board b = after;
     td.stkTo[0] = -1; td.stkPt[0] = 0;
-    td.evalStack[0] = b.inCheck() ? NO_EVAL : evalSide(b);
+    td.evalStack[0] = rootEval(td, b);
     abortFlag = false;                                // the finished search left it set
     g_deadlineNs = nowNs() + 30000000LL;
     Move best = moves[0];

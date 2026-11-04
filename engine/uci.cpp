@@ -1,5 +1,6 @@
 #include "uci.hpp"
 #include "book.hpp"
+#include "eval.hpp"
 #include "search.hpp"
 #include "tb.hpp"
 #include <algorithm>
@@ -120,6 +121,7 @@ void uciLoop() {
                       << "option name Threads type spin default 1 min 1 max 256\n"
                       << "option name Ponder type check default false\n"
                       << "option name Clear Hash type button\n"
+                      << "option name EvalFile type string default <empty>\n"
                       << "option name SyzygyPath type string default syzygy\n"
                       << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n"
                       << "uciok" << std::endl;
@@ -142,6 +144,21 @@ void uciLoop() {
                 setThreads(std::atoi(value.c_str()));
             } else if (name == "Ponder") {
                 g_ponderOption = (value == "true");
+            } else if (name == "EvalFile") {
+                finishSearch();                          // never swap the eval under a running search
+                if (value.empty() || value == "<empty>") {
+                    unloadNNUE();
+                    clearTT();
+                    std::cout << "info string NNUE off, using the handcrafted eval" << std::endl;
+                } else {
+                    std::string err;
+                    if (loadNNUE(value, &err)) {
+                        clearTT();                       // stored scores came from the old eval
+                        std::cout << "info string NNUE loaded: " << value << std::endl;
+                    } else {
+                        std::cout << "info string could not load net '" << value << "': " << err << std::endl;
+                    }
+                }
             } else if (name == "SyzygyPath") {
                 finishSearch();                          // never swap tables under a running search
                 if (!tbInit(value)) std::cerr << "Warning: no Syzygy tables found in '" << value << "'" << std::endl;

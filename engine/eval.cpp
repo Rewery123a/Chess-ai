@@ -1,5 +1,6 @@
 #include "eval.hpp"
 #include "tables.hpp"
+#include "nnue.hpp"
 #include <algorithm>
 #include <vector>
 #include <cstdint>
@@ -144,7 +145,8 @@ const PawnEntry& pawnEntry(U64 wp, U64 bp) {
 } // namespace
 
 // Score from White's point of view, blending middlegame and endgame by material left.
-int evaluate(const Board& b) {
+// handcrafted evaluation (used when no net is loaded)
+static int evaluateHCE(const Board& b) {
     U64 pcs[2][6];
     U64 side[2] = {0, 0};
     for (int c = 0; c < 2; ++c) {
@@ -385,8 +387,38 @@ int evaluate(const Board& b) {
 // Shared by all search threads: one 64-bit word per slot, (check << 32) | score, read and written
 // atomically so a slot can never mix the check of one position with the score of another.
 namespace {
+// ---------- NNUE ----------
+// Score from the side to move's point of view, computed from scratch (no incremental accumulator yet).
+static int nnueSide(const Board& b) {
+    nnue::Accumulator acc;
+    nnueRefresh(b, acc);
+    const int s = nnue::evaluate(acc, b.sideToMove() == Color::WHITE ? 0 : 1);
+    return std::max(-20000, std::min(20000, s));        // stay far below the tablebase / mate scores
+}
+
 constexpr size_t EVAL_CACHE_SIZE = 1 << 20;                      // 8 MB
 std::vector<uint64_t> evalCache(EVAL_CACHE_SIZE, 0);
+}
+
+void nnueRefresh(const Board& b, nnue::Accumulator& acc) {
+    nnue::reset(acc);
+    for (int c = 0; c < 2; ++c) {
+        const Color col = c == 0 ? Color::WHITE : Color::BLACK;
+        for (int pt = 0; pt < 6; ++pt) {
+            U64 bb = b.pieces(PT[pt], col).getBits();
+            while (bb) {
+                const int sq = popLsb(bb);
+                nnue::addFeature(acc, 0, nnue::featureIndex(0, c, pt, sq));
+                nnue::addFeature(acc, 1, nnue::featureIndex(1, c, pt, sq));
+            }
+        }
+    }
+}
+
+int evaluate(const Board& b) {
+    if (!nnue::loaded()) return evaluateHCE(b);
+    const int s = nnueSide(b);
+    return b.sideToMove() == Color::WHITE ? s : -s;
 }
 
 int evalSide(const Board& b) {
@@ -396,7 +428,19 @@ int evalSide(const Board& b) {
     const uint64_t v = __atomic_load_n(&slot, __ATOMIC_RELAXED);
     if ((uint32_t)(v >> 32) == check) return (int)(int32_t)(uint32_t)v;
     int s = evaluate(b);
-    s = (b.sideToMove() == Color::WHITE ? s : -s) + TEMPO;
+    s = (b.sideToMove() == Color::WHITE ? s : -s) + (nnue::loaded() ? 0 : TEMPO);   // the net already knows about tempo
     __atomic_store_n(&slot, ((uint64_t)check << 32) | (uint32_t)s, __ATOMIC_RELAXED);
     return s;
 }
+
+// ---------- net loading (call from the UCI "EvalFile" option, never while searching) ----------
+bool loadNNUE(const std::string& path, std::string* err) {
+    const bool ok = nnue::load(path, err);
+    std::fill(evalCache.begin(), evalCache.end(), 0);   // cached scores belong to the old eval
+    return ok;
+}
+void unloadNNUE() {
+    nnue::unload();
+    std::fill(evalCache.begin(), evalCache.end(), 0);
+}
+bool nnueLoaded() { return nnue::loaded(); }
