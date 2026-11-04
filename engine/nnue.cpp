@@ -3,30 +3,36 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #define NNUE_X86 1
 #endif
 
-// Net file layout (little endian):
-//   char    magic[8] = "CHSNNUE1"
+// Net file layout, v2 (little endian), written by nnue_tools/nnue_format.py:
+//   char    magic[8] = "CHSNNUE2"
 //   uint32  hidden
 //   int32   QA, QB, SCALE
-//   int16   ftWeights[768][hidden]      (real weight * QA)
-//   int16   ftBias[hidden]              (real bias * QA)
-//   int16   outWeights[2 * hidden]      (real weight * QB; first `hidden` = side to move, then the other side)
-//   int32   outBias                     (real bias * QA * QB)
+//   uint32  kingBuckets (8), outputBuckets (8)
+//   int16   ftWeights[kingBuckets * 768][hidden]   (real weight * QA)
+//   int16   ftBias[hidden]                         (real bias * QA)
+//   int16   outWeights[outputBuckets][2 * hidden]  (real weight * QB; per bucket: first `hidden` = side to
+//                                                   move, then the other side)
+//   int32   outBias[outputBuckets]                 (real bias * QA * QB)
 //
-// Inference (all integer):  c = clamp(acc, 0, QA);  sum = sum(c * c * w);  sum /= QA;  sum += outBias;
-//                           score = sum * SCALE / (QA * QB)     (divisions truncate toward zero)
+// Inference (all integer), with b = the output bucket:
+//   c = clamp(acc, 0, QA);  sum = sum(c * c * w[b]);  sum /= QA;  sum += outBias[b];
+//   score = sum * SCALE / (QA * QB)          (divisions truncate toward zero)
 
 namespace nnue {
 
 namespace {
-alignas(64) int16_t g_ftW[(size_t)NUM_FEATURES * MAX_HIDDEN];
+constexpr size_t FT_ROWS = (size_t)KING_BUCKETS * NUM_FEATURES;
+
+alignas(64) int16_t g_ftW[FT_ROWS * MAX_HIDDEN];
 alignas(64) int16_t g_ftB[MAX_HIDDEN];
-alignas(64) int16_t g_outW[2 * MAX_HIDDEN];
-int32_t g_outB = 0;
+alignas(64) int16_t g_outW[(size_t)OUTPUT_BUCKETS * 2 * MAX_HIDDEN];
+int32_t g_outB[OUTPUT_BUCKETS];
 int  g_hidden = 0, g_qa = 255, g_qb = 64, g_scale = 400;
 bool g_loaded = false;
 bool g_avx2 = false;         // this CPU can run the AVX2 paths (checked once, at load)
@@ -39,37 +45,45 @@ bool fail(std::string* err, const char* msg) { if (err) *err = msg; return false
 bool load(const std::string& path, std::string* err) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return fail(err, "cannot open net file");
-    char magic[8]; uint32_t hidden = 0; int32_t qa = 0, qb = 0, scale = 0;
-    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "CHSNNUE1", 8) != 0 ||
-        std::fread(&hidden, 4, 1, f) != 1 || std::fread(&qa, 4, 1, f) != 1 ||
-        std::fread(&qb, 4, 1, f) != 1 || std::fread(&scale, 4, 1, f) != 1) {
+    char magic[8]; uint32_t hidden = 0, kb = 0, ob = 0; int32_t qa = 0, qb = 0, scale = 0;
+    if (std::fread(magic, 1, 8, f) != 8 || std::fread(&hidden, 4, 1, f) != 1 || std::fread(&qa, 4, 1, f) != 1 ||
+        std::fread(&qb, 4, 1, f) != 1 || std::fread(&scale, 4, 1, f) != 1 || std::fread(&kb, 4, 1, f) != 1 ||
+        std::fread(&ob, 4, 1, f) != 1) {
         std::fclose(f);
         return fail(err, "bad net header");
     }
-    if (hidden == 0 || hidden > (uint32_t)MAX_HIDDEN || qa <= 0 || qb <= 0 || scale <= 0) {
+    if (std::memcmp(magic, "CHSNNUE2", 8) != 0) {
+        std::fclose(f);
+        return fail(err, std::memcmp(magic, "CHSNNUE1", 8) == 0 ? "this is an old (v1) net; the engine needs a v2 net"
+                                                                 : "bad net header");
+    }
+    if (hidden == 0 || hidden > (uint32_t)MAX_HIDDEN || qa <= 0 || qa > 32767 || qb <= 0 || scale <= 0 ||
+        kb != (uint32_t)KING_BUCKETS || ob != (uint32_t)OUTPUT_BUCKETS) {
         std::fclose(f);
         return fail(err, "unsupported net parameters");
     }
     // read into temporaries first so a bad file never clobbers a working net
-    static int16_t tW[(size_t)NUM_FEATURES * MAX_HIDDEN], tB[MAX_HIDDEN], tO[2 * MAX_HIDDEN];
-    int32_t tOB = 0;
-    const size_t nW = (size_t)NUM_FEATURES * hidden, nO = 2 * (size_t)hidden;
-    bool ok = std::fread(tW, 2, nW, f) == nW && std::fread(tB, 2, hidden, f) == hidden &&
-              std::fread(tO, 2, nO, f) == nO && std::fread(&tOB, 4, 1, f) == 1;
+    const size_t nW = FT_ROWS * hidden, nO = (size_t)OUTPUT_BUCKETS * 2 * hidden;
+    std::vector<int16_t> tW(nW), tB(hidden), tO(nO);
+    int32_t tOB[OUTPUT_BUCKETS];
+    bool ok = std::fread(tW.data(), 2, nW, f) == nW && std::fread(tB.data(), 2, hidden, f) == hidden &&
+              std::fread(tO.data(), 2, nO, f) == nO && std::fread(tOB, 4, OUTPUT_BUCKETS, f) == (size_t)OUTPUT_BUCKETS;
     const bool extra = ok && std::fgetc(f) != EOF;      // trailing bytes: wrong file
     std::fclose(f);
     if (!ok || extra) return fail(err, "net file has the wrong size");
 
-    std::memcpy(g_ftW, tW, nW * 2);
-    std::memcpy(g_ftB, tB, (size_t)hidden * 2);
-    std::memcpy(g_outW, tO, nO * 2);
-    g_outB = tOB; g_hidden = (int)hidden; g_qa = qa; g_qb = qb; g_scale = scale;
+    std::memcpy(g_ftW, tW.data(), nW * 2);
+    std::memcpy(g_ftB, tB.data(), (size_t)hidden * 2);
+    std::memcpy(g_outW, tO.data(), nO * 2);
+    std::memcpy(g_outB, tOB, sizeof(tOB));
+    g_hidden = (int)hidden; g_qa = qa; g_qb = qb; g_scale = scale;
 #ifdef NNUE_X86
     __builtin_cpu_init();
     g_avx2 = __builtin_cpu_supports("avx2");
 #endif
     // The AVX2 evaluation computes (c * w) as int16 and (c * w) * c as int32 lane sums. That is exact (identical to
-    // the plain code) when |w| * QA fits in int16 and the lane sums cannot overflow int32. Check both here.
+    // the plain code) when |w| * QA fits in int16 and the lane sums cannot overflow int32. Check both here, over
+    // the weights of every output bucket.
     int maxW = 0;
     for (size_t i = 0; i < nO; ++i) maxW = std::max(maxW, std::abs((int)g_outW[i]));
     const int64_t perLane = (int64_t)(2 * (int64_t)hidden / 16) * 2 * (int64_t)maxW * qa * qa;   // madd iterations * 2 products
@@ -82,9 +96,13 @@ void unload()        { g_loaded = false; }
 bool loaded()        { return g_loaded; }
 int  hiddenSize()    { return g_hidden; }
 
+void resetPerspective(Accumulator& acc, int perspective) {
+    std::memcpy(acc.v[perspective], g_ftB, (size_t)g_hidden * sizeof(int16_t));
+}
+
 void reset(Accumulator& acc) {
-    for (int p = 0; p < 2; ++p)
-        std::memcpy(acc.v[p], g_ftB, (size_t)g_hidden * sizeof(int16_t));
+    resetPerspective(acc, 0);
+    resetPerspective(acc, 1);
 }
 
 void copy(Accumulator& dst, const Accumulator& src) {
@@ -151,17 +169,18 @@ __attribute__((target("avx2"))) static int64_t sumAVX2(const int16_t* us, const 
 void setSimd(bool on) { g_simdAllowed = on; }
 bool simdActive()     { return g_avx2 && g_simdAllowed; }
 
-int evaluate(const Accumulator& acc, int stm) {
+int evaluate(const Accumulator& acc, int stm, int bucket) {
+    bucket = std::max(0, std::min(bucket, OUTPUT_BUCKETS - 1));
     const int16_t* us   = acc.v[stm];
     const int16_t* them = acc.v[stm ^ 1];
-    const int16_t* wUs  = g_outW;
-    const int16_t* wTh  = g_outW + g_hidden;
+    const int16_t* wUs  = g_outW + (size_t)bucket * 2 * g_hidden;
+    const int16_t* wTh  = wUs + g_hidden;
     const int qa = g_qa;
 #ifdef NNUE_X86
     if (g_avx2 && g_simdAllowed && g_fastEval) {
         int64_t sum = sumAVX2(us, them, wUs, wTh, g_hidden, qa);
         sum /= qa;
-        sum += g_outB;
+        sum += g_outB[bucket];
         return (int)(sum * g_scale / ((int64_t)qa * g_qb));
     }
 #endif
@@ -173,7 +192,7 @@ int evaluate(const Accumulator& acc, int stm) {
         sum += (int64_t)((int32_t)(ct * ct) * (int32_t)wTh[i]);
     }
     sum /= qa;
-    sum += g_outB;
+    sum += g_outB[bucket];
     return (int)(sum * g_scale / ((int64_t)qa * g_qb));
 }
 

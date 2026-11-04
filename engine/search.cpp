@@ -250,6 +250,7 @@ struct ThreadData {
     nnue::Accumulator acc[MAX_PLY + 2];
     AccDelta delta[MAX_PLY + 2];
     bool     accValid[MAX_PLY + 2];
+    uint8_t  accKey[MAX_PLY + 2][2];              // v2 net: king key (bucket, mirror) each perspective of acc[p] was built with
     bool     useNN = false;                       // a net is loaded: evaluate with it
     // principal variation (triangular table): pv[ply][ply .. pvLen[ply]-1] is the line found from that ply
     Move     pv[MAX_PLY + 2][MAX_PLY + 2];
@@ -314,16 +315,67 @@ static inline void accSetNull(ThreadData& td, int ply) {   // null move: same pi
     td.delta[ply].nsub = td.delta[ply].nadd = 0;
 }
 
-static void accUpdateTo(ThreadData& td, int ply) {
+// v2 net: a perspective's features are indexed relative to ITS OWN king (king bucket + left/right mirroring), so
+// when that king moves to another bucket or across the d/e file line every feature of that perspective changes
+// and it has to be rebuilt from the piece placement instead of updated. This happens on a small fraction of king
+// moves. The placement at ply j is recovered from the board at ply `ply` (>= j) by undoing the deltas of the
+// plies in between; no board copies are stored in the tree.
+#ifdef NNUE_VERIFY
+static std::atomic<uint64_t> g_dbgRefreshNow{0}, g_dbgRefreshBack{0}, g_dbgEvals{0};
+uint64_t nnueVerifyStat(int which) { return which == 0 ? g_dbgRefreshNow.load() : which == 1 ? g_dbgRefreshBack.load() : g_dbgEvals.load(); }
+#endif
+
+static void accRefreshPerspective(ThreadData& td, const Board& b, int ply, int j, int p) {
+    static const PieceType ACC_PT[6] = {PieceType::PAWN, PieceType::KNIGHT, PieceType::BISHOP,
+                                        PieceType::ROOK, PieceType::QUEEN, PieceType::KING};
+    uint64_t pcs[2][6];
+    for (int c = 0; c < 2; ++c)
+        for (int pt = 0; pt < 6; ++pt)
+            pcs[c][pt] = b.pieces(ACC_PT[pt], c == 0 ? Color::WHITE : Color::BLACK).getBits();
+    for (int i = ply; i > j; --i) {                    // undo plies ply, ply-1, ..., j+1
+        const ThreadData::AccDelta& d = td.delta[i];
+        for (int a = 0; a < d.nadd; ++a) pcs[d.add[a].colour][d.add[a].pt] &= ~(1ULL << d.add[a].sq);
+        for (int s = 0; s < d.nsub; ++s) pcs[d.sub[s].colour][d.sub[s].pt] |= 1ULL << d.sub[s].sq;
+    }
+#ifdef NNUE_VERIFY
+    (j == ply ? g_dbgRefreshNow : g_dbgRefreshBack)++;
+#endif
+    const int key = pcs[p][5] ? nnue::kingKey(p, __builtin_ctzll(pcs[p][5])) : 0;
+    td.accKey[j][p] = (uint8_t)key;
+    nnue::resetPerspective(td.acc[j], p);
+    for (int c = 0; c < 2; ++c)
+        for (int pt = 0; pt < 6; ++pt) {
+            uint64_t bb = pcs[c][pt];
+            while (bb) {
+                const int sq = __builtin_ctzll(bb);
+                bb &= bb - 1;
+                nnue::addFeature(td.acc[j], p, nnue::featureIndex(p, key, c, pt, sq));
+            }
+        }
+}
+
+// Brings acc[ply] up to date: finds the nearest ancestor whose accumulator is valid and applies the deltas of
+// the plies in between (usually just one). `b` is the position at `ply`.
+static void accUpdateTo(ThreadData& td, const Board& b, int ply) {
     int k = ply;
     while (k > 0 && !td.accValid[k]) --k;
     for (int j = k + 1; j <= ply; ++j) {
         nnue::copy(td.acc[j], td.acc[j - 1]);
         const ThreadData::AccDelta& d = td.delta[j];
-        for (int i = 0; i < d.nsub; ++i)
-            for (int p = 0; p < 2; ++p) nnue::subFeature(td.acc[j], p, nnue::featureIndex(p, d.sub[i].colour, d.sub[i].pt, d.sub[i].sq));
-        for (int i = 0; i < d.nadd; ++i)
-            for (int p = 0; p < 2; ++p) nnue::addFeature(td.acc[j], p, nnue::featureIndex(p, d.add[i].colour, d.add[i].pt, d.add[i].sq));
+        for (int p = 0; p < 2; ++p) {
+            int key = td.accKey[j - 1][p];
+            for (int i = 0; i < d.nadd; ++i)           // did this move put perspective p's own king on a new key?
+                if (d.add[i].pt == 5 && d.add[i].colour == p) key = nnue::kingKey(p, d.add[i].sq);
+            if (key != td.accKey[j - 1][p]) {
+                accRefreshPerspective(td, b, ply, j, p);
+                continue;
+            }
+            td.accKey[j][p] = (uint8_t)key;
+            for (int i = 0; i < d.nsub; ++i)
+                nnue::subFeature(td.acc[j], p, nnue::featureIndex(p, key, d.sub[i].colour, d.sub[i].pt, d.sub[i].sq));
+            for (int i = 0; i < d.nadd; ++i)
+                nnue::addFeature(td.acc[j], p, nnue::featureIndex(p, key, d.add[i].colour, d.add[i].pt, d.add[i].sq));
+        }
         td.accValid[j] = true;
     }
 }
@@ -331,19 +383,22 @@ static void accUpdateTo(ThreadData& td, int ply) {
 // static eval from the side to move's point of view (net if loaded, else the handcrafted eval)
 static inline int evalAt(ThreadData& td, const Board& b, int ply) {
     if (!td.useNN) return evalSide(b);
-    accUpdateTo(td, ply);
+    accUpdateTo(td, b, ply);
 #ifdef NNUE_VERIFY
     {
+        ++g_dbgEvals;
         nnue::Accumulator ref;
         nnueRefresh(b, ref);
         for (int p = 0; p < 2; ++p)
             if (std::memcmp(ref.v[p], td.acc[ply].v[p], (size_t)nnue::hiddenSize() * sizeof(int16_t)) != 0) {
-                std::cerr << "NNUE accumulator mismatch at ply " << ply << " fen " << b.getFen() << std::endl;
+                std::cerr << "NNUE accumulator mismatch at ply " << ply << " perspective " << p << " fen " << b.getFen() << std::endl;
                 std::abort();
             }
     }
 #endif
-    const int s = nnue::evaluate(td.acc[ply], b.sideToMove() == Color::WHITE ? 0 : 1);
+    const int bucket = nnue::outputBucket(__builtin_popcountll(b.occ().getBits()));
+    int s = nnue::evaluate(td.acc[ply], b.sideToMove() == Color::WHITE ? 0 : 1, bucket);
+    s = nnueAdjust(b, s);                              // mop-up / drawish endings, same as the non-incremental path
     return std::max(-20000, std::min(20000, s));
 }
 
@@ -352,6 +407,10 @@ static int rootEval(ThreadData& td, const Board& b) {
     td.useNN = nnue::loaded();
     if (td.useNN) {
         nnueRefresh(b, td.acc[0]);
+        for (int p = 0; p < 2; ++p) {
+            const uint64_t k = b.pieces(PieceType::KING, p == 0 ? Color::WHITE : Color::BLACK).getBits();
+            td.accKey[0][p] = (uint8_t)(k ? nnue::kingKey(p, __builtin_ctzll(k)) : 0);
+        }
         td.accValid[0] = true;
     }
     return b.inCheck() ? -INF : evalAt(td, b, 0);

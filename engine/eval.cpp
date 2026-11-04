@@ -386,13 +386,90 @@ static int evaluateHCE(const Board& b) {
 // Index = low hash bits, check = high 32 bits.
 // Shared by all search threads: one 64-bit word per slot, (check << 32) | score, read and written
 // atomically so a slot can never mix the check of one position with the score of another.
+// ---------- endgame knowledge on top of the net ----------
+// The handcrafted eval knows mop-up and a few drawish endings; the net has to learn them from data that has no
+// mate scores and few positions with under ten pieces. These rules mirror evaluateHCE (same constants, same
+// blending by game phase) and only fire in thin endings (phase <= 10), so ordinary positions cost one early exit.
+static int g_nnEgMask = 3;
+static const int NN_EG_MOPUP = 1, NN_EG_DRAWISH = 2, NN_EG_OCB = 4;
+
+int nnueAdjust(const Board& b, int stmScore) {
+    const int mask = g_nnEgMask;
+    if (!mask) return stmScore;
+
+    int cnt[2][5];                                          // P N B R Q per colour
+    U64 bishops[2];
+    int phase = 0;
+    for (int c = 0; c < 2; ++c) {
+        const Color col = c == 0 ? Color::WHITE : Color::BLACK;
+        for (int pt = 0; pt < 5; ++pt) {
+            const U64 bb = b.pieces(PT[pt], col).getBits();
+            cnt[c][pt] = popcnt(bb);
+            if (pt == 2) bishops[c] = bb;
+            if (pt > 0) phase += cnt[c][pt] * PHASE_W[pt];
+        }
+    }
+    if (phase > 10) return stmScore;                        // not a thin ending: leave the net alone
+
+    const int stm = b.sideToMove() == Color::WHITE ? 0 : 1;
+    int white = stm == 0 ? stmScore : -stmScore;            // work from White's point of view
+
+    int mat[2], np[2];                                      // material (pawns included) / non-pawn material
+    for (int c = 0; c < 2; ++c) {
+        np[c] = 0;
+        for (int pt = 1; pt < 5; ++pt) np[c] += cnt[c][pt] * MG_VAL[pt];
+        mat[c] = np[c] + cnt[c][0] * MG_VAL[0];
+    }
+
+    // mop-up: a clearly winning side in a thin endgame drives the enemy king to the edge
+    if (mask & NN_EG_MOPUP) {
+        const U64 wk = b.pieces(PieceType::KING, Color::WHITE).getBits();
+        const U64 bk = b.pieces(PieceType::KING, Color::BLACK).getBits();
+        const int diff = mat[0] - mat[1];
+        if (std::abs(diff) >= 300 && wk && bk) {
+            const int kingSq[2] = {__builtin_ctzll(wk), __builtin_ctzll(bk)};
+            const int w = diff > 0 ? 0 : 1, l = w ^ 1;
+            const int lf = kingSq[l] & 7, lr = kingSq[l] >> 3, wf = kingSq[w] & 7, wr = kingSq[w] >> 3;
+            const int cornerDist = std::max(3 - lf, lf - 4) + std::max(3 - lr, lr - 4);   // 0 centre .. 6 corner
+            const int kingDist = std::abs(lf - wf) + std::abs(lr - wr);
+            const int bonus = (6 * cornerDist + 3 * (14 - kingDist)) * (24 - phase) / 24;   // endgame weight, as in the HCE
+            white += w == 0 ? bonus : -bonus;
+        }
+    }
+
+    // drawish endings: shrink the score of the side that is ahead (sf out of 64, blended by phase like the HCE)
+    if (mask & (NN_EG_DRAWISH | NN_EG_OCB)) {
+        const int strong = white > 0 ? 0 : 1, weak = strong ^ 1;
+        const int pawnsStrong = cnt[strong][0], pawnsWeak = cnt[weak][0];
+        const bool noNRQ = !(cnt[0][1] | cnt[1][1] | cnt[0][3] | cnt[1][3] | cnt[0][4] | cnt[1][4]);
+        const bool noNQ  = !(cnt[0][1] | cnt[1][1] | cnt[0][4] | cnt[1][4]);
+        const bool ocb = cnt[0][2] == 1 && cnt[1][2] == 1 &&
+                         ((bishops[0] & LIGHT_SQ) != 0) != ((bishops[1] & LIGHT_SQ) != 0);
+        int sf = 64;
+        if ((mask & NN_EG_OCB) && ocb && noNRQ)
+            sf = std::min(64, 22 + 3 * pawnsStrong);                         // opposite-coloured bishops only
+        else if ((mask & NN_EG_OCB) && ocb && noNQ && cnt[0][3] == 1 && cnt[1][3] == 1)
+            sf = 48;                                                         // ... with one rook each
+        else if ((mask & NN_EG_DRAWISH) && pawnsStrong == 0 && pawnsWeak == 0 && np[strong] - np[weak] <= 340)
+            sf = 6;                                                          // no pawns at all, at most a minor piece ahead
+        else if ((mask & NN_EG_DRAWISH) && pawnsStrong == 0 && pawnsWeak == 0 && np[weak] == 0 &&
+                 np[strong] == 2 * MG_VAL[1] && cnt[strong][1] == 2)
+            sf = 6;                                                          // two knights against a bare king
+        if (sf != 64) white = white * (phase * 64 + (24 - phase) * sf) / (24 * 64);
+    }
+    return stm == 0 ? white : -white;
+}
+
 namespace {
 // ---------- NNUE ----------
-// Score from the side to move's point of view, computed from scratch (no incremental accumulator yet).
+// Score from the side to move's point of view, computed from scratch. The search keeps an incremental
+// accumulator instead (search.cpp, evalAt); this path serves evaluate()/evalSide() outside the search.
 static int nnueSide(const Board& b) {
     nnue::Accumulator acc;
     nnueRefresh(b, acc);
-    const int s = nnue::evaluate(acc, b.sideToMove() == Color::WHITE ? 0 : 1);
+    const int bucket = nnue::outputBucket(popcnt(b.occ().getBits()));
+    int s = nnue::evaluate(acc, b.sideToMove() == Color::WHITE ? 0 : 1, bucket);
+    s = nnueAdjust(b, s);
     return std::max(-20000, std::min(20000, s));        // stay far below the tablebase / mate scores
 }
 
@@ -401,6 +478,13 @@ std::vector<uint64_t> evalCache(EVAL_CACHE_SIZE, 0);
 }
 
 void nnueRefresh(const Board& b, nnue::Accumulator& acc) {
+    // Each perspective's features depend on where ITS OWN king stands (king bucket + left/right mirroring),
+    // so find both kings first. A position without a king cannot occur in legal play; key 0 keeps it safe.
+    int key[2] = {0, 0};
+    for (int p = 0; p < 2; ++p) {
+        const U64 k = b.pieces(PieceType::KING, p == 0 ? Color::WHITE : Color::BLACK).getBits();
+        if (k) key[p] = nnue::kingKey(p, __builtin_ctzll(k));
+    }
     nnue::reset(acc);
     for (int c = 0; c < 2; ++c) {
         const Color col = c == 0 ? Color::WHITE : Color::BLACK;
@@ -408,8 +492,8 @@ void nnueRefresh(const Board& b, nnue::Accumulator& acc) {
             U64 bb = b.pieces(PT[pt], col).getBits();
             while (bb) {
                 const int sq = popLsb(bb);
-                nnue::addFeature(acc, 0, nnue::featureIndex(0, c, pt, sq));
-                nnue::addFeature(acc, 1, nnue::featureIndex(1, c, pt, sq));
+                nnue::addFeature(acc, 0, nnue::featureIndex(0, key[0], c, pt, sq));
+                nnue::addFeature(acc, 1, nnue::featureIndex(1, key[1], c, pt, sq));
             }
         }
     }
@@ -444,3 +528,9 @@ void unloadNNUE() {
     std::fill(evalCache.begin(), evalCache.end(), 0);
 }
 bool nnueLoaded() { return nnue::loaded(); }
+
+void setNNUEEndgame(int mask) {
+    g_nnEgMask = std::max(0, std::min(mask, 7));
+    std::fill(evalCache.begin(), evalCache.end(), 0);   // cached scores were computed with the old setting
+}
+int nnueEndgame() { return g_nnEgMask; }

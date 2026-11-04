@@ -14,3 +14,14 @@ bool nnueLoaded();
 
 // Builds the NNUE accumulator for a position from scratch (used at the search root and for verification).
 void nnueRefresh(const chess::Board& b, nnue::Accumulator& acc);
+
+// Endgame knowledge applied on top of the net's score (the net was never shown mate scores and has few
+// endgame positions). stmScore / the result are from the side to move's point of view.
+//   mask bit 1: mop-up  (a side far ahead in material in a thin ending drives the enemy king to the edge)
+//   mask bit 2: drawish pawnless endings (no pawns, at most a minor piece ahead; two knights vs bare king)
+//   mask bit 4: opposite-coloured-bishop endings are scaled towards a draw
+// Default 3. The net was trained on Stockfish scores that already contain the bishop rule, so test bit 4
+// separately (SPRT). setNNUEEndgame() clears the eval cache; never call it while a search is running.
+int  nnueAdjust(const chess::Board& b, int stmScore);
+void setNNUEEndgame(int mask);
+int  nnueEndgame();
